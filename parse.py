@@ -12,9 +12,9 @@ from config import DISTRICTS, GROUPS
 # ---------- спільне ----------
 
 # У каналах: лише «1.1». Не чіпає дати/час (19.11.2026, 16.30) і списки будинків «(1, 2, 5)».
-GROUP_RE = re.compile(r"(?<![\d.:,/])([1-6])\.([12])(?![\d:])")
+GROUP_RE = re.compile(r"(?<![\d.:,/])([1-6])\.([12])(?!\d|:\d)")  # «1.1:» ок, «1.10»/«1.1:30» ні
 # У людей: ще «1,1» (без пробілу) і «1. 1»; «1, 2» — це номери будинків
-USER_GROUP_RE = re.compile(r"(?<![\d.:,/])([1-6])(?:\s?\.\s?|,)([12])(?![\d:,])")
+USER_GROUP_RE = re.compile(r"(?<![\d.:,/])([1-6])(?:\s?\.\s?|,)([12])(?!\d|:\d|,\s?\d)")
 # «черга 4», «4 група», «очередь 4» -> вся черга (4.1 + 4.2)
 QUEUE_RE = re.compile(
     r"(?:черг[аиіу]|очеред[ьи]|груп[аиу])\s*№?\s*([1-6])(?![\d.,])|(?<![\d.,])([1-6])\s*(?:черг|очеред|груп)"
@@ -29,6 +29,7 @@ CENSOR = re.compile(
 # Не про світло
 OFF_TOPIC = re.compile(r"водопостач|вод[аиу]\b|тиск|газ\b|газу|опален|тепл|котел|інтернет|интернет|зв.яз|связь")
 
+PROMO = re.compile(r"натискайте|завжди під рукою|обирайте свою черг|підписуйтесь|переходьте за посиланням|знижк|розпродаж")
 OTHER_CITY = re.compile(r"самар|кам.янськ|павлоград|кривий ріг|кривой рог|нікопол|марганц|жовті води|синельников")
 
 FOOTERS = re.compile(
@@ -83,6 +84,64 @@ class Alert:
     grp: str  # "3.2" або "*" (для всіх)
     until: str | None
     text: str  # готовий текст для пуша
+    provider: str = "dtek"  # dtek | cek | * (обом)
+
+
+# ---------- ЦЕК ----------
+
+MONTHS = {
+    "січ": 1, "лют": 2, "берез": 3, "квіт": 4, "трав": 5, "черв": 6,
+    "лип": 7, "серп": 8, "верес": 9, "жовт": 10, "листопад": 11, "груд": 12,
+}
+INTERVAL_RE = re.compile(r"(\d{1,2}):(\d{2})\s*[—–-]\s*(\d{1,2}):(\d{2})")
+
+
+def _cek_date(t: str, today):
+    """«графік на 2026-11-19» / «на 20 листопада» / без дати -> сьогодні."""
+    from datetime import date
+
+    if m := re.search(r"(\d{4})-(\d{2})-(\d{2})", t):
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    if m := re.search(r"(\d{1,2})\s+(січ|лют|берез|квіт|трав|черв|лип|серп|верес|жовт|листопад|груд)\w*", t):
+        month = MONTHS[m.group(2)]
+        year = today.year + (1 if month < today.month - 6 else 0)  # графік на січень, а зараз грудень
+        return date(year, month, int(m.group(1)))
+    return today
+
+
+def parse_cek_schedule(raw: str, today) -> tuple | None:
+    """Пост з графіком ЦЕК -> (date, {"1.1": [(9.5, 13.0), ...]}). Груп може бути не всі (зміни)."""
+    t = strip_footer(raw).lower()
+    if "цек" not in t or not re.search(r"графік|зміни для", t):
+        return None
+    t = t[t.rfind("\n", 0, t.index("цек")) + 1:]  # у комбо-постах «ДТЕК + ЦЕК» беремо лише частину ЦЕК
+    groups: dict[str, list] = {}
+    cur = None
+    for line in t.splitlines():
+        if gs := find_groups(line):
+            cur = gs[0]
+            groups.setdefault(cur, [])
+        if cur:
+            for h1, m1, h2, m2 in INTERVAL_RE.findall(line):
+                groups[cur].append((int(h1) + int(m1) / 60, int(h2) + int(m2) / 60))
+    groups = {g: v for g, v in groups.items() if v or "графік" in t}
+    if len(groups) < 3:  # це не графік, а одне попередження
+        return None
+    return _cek_date(t, today), groups
+
+
+def _parse_cek(text: str, t: str) -> list[Alert]:
+    """Не-графікові пости ЦЕК: зміни в ГПВ, скасування."""
+    if re.search(r"скасуван|скасован", t):
+        return [Alert("general", "*", None, "📢 " + _general(text).text[2:], "cek")]
+    # «ЦЕК - зміни в ГПВ на 19 ЛИСТОПАДА … з 10:20 до 12:30 відключаються черги: 2.1, 2.2, 5.1»
+    if "зміни" in t and (m := re.search(r"з\s+(\d{1,2}:\d{2})\s+до\s+(\d{1,2}:\d{2})", t)):
+        frm, until = m.groups()
+        return [
+            Alert("off", g, until, f"⚠️ <b>ЦЕК: зміни в графіку</b> · група <b>{g}</b>\n⏱ Відключення з <b>{frm}</b> до <b>{until}</b>", "cek")
+            for g in find_groups(t)
+        ]
+    return []
 
 
 def _off(grp, until, label="Аварійне/екстрене відключення"):
@@ -128,13 +187,31 @@ def _dnipro_until(t: str) -> str | None:
 
 
 def parse_channel(raw: str) -> list[Alert]:
+    alerts = _parse_channel(raw)
+    t = raw.lower()
+    for a in alerts:  # загальні без згадки ДТЕК (накази Укренерго тощо) — обом постачальникам
+        if a.kind == "general" and a.provider == "dtek" and not re.search(r"дтек|дтэк", t):
+            a.provider = "*"
+    return alerts
+
+
+def _parse_channel(raw: str) -> list[Alert]:
     text = strip_footer(raw)
     t = text.lower()
     first = t.split("\n", 1)[0]
     if not text or CENSOR.search(t):
         return []
-    if "цек" in t:  # ЦЕК — інший постачальник з тими ж номерами груп; бот поки лише для ДТЕК
+    if PROMO.search(t):  # реклама інших ботів/каналів
         return []
+    if "цек" in t:
+        # «ЦЕК /ДТЭК аварійні, графіки не працюють» — обом; інакше — лише абонентам ЦЕК
+        if re.search(r"дтек|дтэк", t) and re.search(r"аварій|екстрен|экстрен|не працюють|не работают", t):
+            return [Alert("general", "*", None, _general(text).text, "*")]
+        if parse_cek_schedule(raw, __import__("datetime").date.today()):
+            return []  # графік — зберігає userbot, пуш «графік оновився» шле notifier
+        if t.startswith("⚠️ увага цек") or "готуємось до відключення" in t:
+            return []  # нагадування за графіком — бот і сам нагадує
+        return _parse_cek(text, t)
     if "дніпр" not in t and "днепр" not in t and OTHER_CITY.search(t):  # пост лише про інше місто
         return []
     if not re.search(r"світл|свет|відключ|отключ|відновл|знеструм|електро|черг|груп|графік|дтек", t):
@@ -239,7 +316,11 @@ def parse_user(raw: str) -> dict | None:
         on, off = False, True
     if on == off:
         return None
-    return {"event": "on" if on else "off", "groups": groups, "district": find_district(t), "street": find_street(raw)}
+    provider = "cek" if "цек" in t else "dtek" if re.search(r"дтек|дтэк", t) else ""
+    return {
+        "event": "on" if on else "off", "groups": groups, "district": find_district(t),
+        "street": find_street(raw), "provider": provider,
+    }
 
 
 # «вул. Шевченка», «на Слобожанском проспекте», «ул Титова 12», «просп. Гагаріна»

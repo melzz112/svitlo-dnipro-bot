@@ -14,9 +14,26 @@ from render import day_text, now_status
 
 router = Router()
 
-MENU_TEXT = "⚡ <b>Світло Дніпро</b>\nГрупа: <b>{grp}</b>\n\nОбери, що показати:"
-PICK_TEXT = "🔢 Обери свою групу відключень.\nДізнатись можна на сайті ДТЕК/YASNO або в рахунку."
+MENU_TEXT = "⚡ <b>Світло Дніпро</b>\n{prov} · група <b>{grp}</b>\n\nОбери, що показати:"
+PICK_TEXT = (
+    "🏢 Обери свого <b>постачальника</b> (ДТЕК чи ЦЕК — є в рахунку за світло),\n"
+    "🔢 потім свою <b>групу</b> відключень.\n\n"
+    "Зараз: <b>{prov}</b>"
+)
+CEK_NOTE = "\n\nℹ️ ЦЕК не публікує графік у вигляді даних — бот бере його з Telegram-каналів, щойно він там з'являється."
 ICON = {"on": "💡", "off": "🕯"}
+
+
+def _prov(u: dict) -> str:
+    return u.get("provider") or "dtek"
+
+
+def _pname(u: dict) -> str:
+    return db.PROVIDER_NAME[_prov(u)]
+
+
+def _menu_text(u: dict) -> str:
+    return MENU_TEXT.format(prov=_pname(u), grp=u["grp"] or "—")
 
 
 async def edit(cb: CallbackQuery, text: str, markup):
@@ -33,33 +50,39 @@ async def edit(cb: CallbackQuery, text: str, markup):
 async def start(m: Message):
     u = await db.get_user(m.from_user.id)
     if not u["grp"]:
-        await m.answer(PICK_TEXT, reply_markup=kb.groups_kb(None))
+        await m.answer(PICK_TEXT.format(prov=_pname(u)), reply_markup=kb.groups_kb(None, _prov(u)))
     else:
-        await m.answer(MENU_TEXT.format(grp=u["grp"]), reply_markup=kb.main_menu())
+        await m.answer(_menu_text(u), reply_markup=kb.main_menu())
+
+
+@router.callback_query(kb.SetProvider.filter())
+async def set_provider(cb: CallbackQuery, callback_data: kb.SetProvider):
+    await db.set_user(cb.from_user.id, provider=callback_data.code)
+    u = await db.get_user(cb.from_user.id)
+    await edit(cb, PICK_TEXT.format(prov=_pname(u)), kb.groups_kb(u["grp"], _prov(u)))
 
 
 @router.callback_query(kb.SetGroup.filter())
 async def set_group(cb: CallbackQuery, callback_data: kb.SetGroup):
     await db.set_user(cb.from_user.id, grp=callback_data.code)
-    await edit(cb, MENU_TEXT.format(grp=callback_data.code), kb.main_menu())
+    await edit(cb, _menu_text(await db.get_user(cb.from_user.id)), kb.main_menu())
 
 
 @router.callback_query(kb.Nav.filter(F.to == "menu"))
 async def menu(cb: CallbackQuery):
-    u = await db.get_user(cb.from_user.id)
-    await edit(cb, MENU_TEXT.format(grp=u["grp"] or "—"), kb.main_menu())
+    await edit(cb, _menu_text(await db.get_user(cb.from_user.id)), kb.main_menu())
 
 
 @router.callback_query(kb.Nav.filter(F.to == "groups"))
 async def groups(cb: CallbackQuery):
     u = await db.get_user(cb.from_user.id)
-    await edit(cb, PICK_TEXT, kb.groups_kb(u["grp"]))
+    await edit(cb, PICK_TEXT.format(prov=_pname(u)), kb.groups_kb(u["grp"], _prov(u)))
 
 
 async def _need_group(cb: CallbackQuery):
     u = await db.get_user(cb.from_user.id)
     if not u["grp"]:
-        await edit(cb, PICK_TEXT, kb.groups_kb(None))
+        await edit(cb, PICK_TEXT.format(prov=_pname(u)), kb.groups_kb(None, _prov(u)))
         return None
     return u
 
@@ -69,11 +92,14 @@ async def sched(cb: CallbackQuery, callback_data: kb.Nav):
     if not (u := await _need_group(cb)):
         return
     day, _, refresh = callback_data.arg.partition("-")
-    s = await get_schedule(force=bool(refresh))
+    s = await get_schedule(force=bool(refresh), provider=_prov(u))
     title = "Сьогодні" if day == "today" else "Завтра"
-    text = day_text(u["grp"], s.get(day, {}).get(u["grp"]), title)
-    if providers.last_update:
-        text += f"\n\n🕒 Оновлено ДТЕК: {providers.last_update}"
+    slots = s.get(day, {}).get(u["grp"])
+    text = f"🏢 {_pname(u)}\n" + day_text(u["grp"], slots, title)
+    if label := await providers.update_label(_prov(u)):
+        text += f"\n\n{label}"
+    if _prov(u) == "cek" and slots is None:
+        text += CEK_NOTE
     await edit(cb, text, kb.sched_kb(day))
 
 
@@ -94,14 +120,15 @@ def _ago(ts: int) -> str:
 async def now(cb: CallbackQuery):
     if not (u := await _need_group(cb)):
         return
-    s = await get_schedule()
-    chat = (await db.chat_stats()).get(u["grp"])
+    p = _prov(u)
+    s = await get_schedule(provider=p)
+    chat = (await db.chat_stats(provider=p)).get(u["grp"])
     text = (
-        f"⚡ <b>Зараз</b> · група <b>{u['grp']}</b>\n\n"
+        f"⚡ <b>Зараз</b> · {_pname(u)} · група <b>{u['grp']}</b>\n\n"
         f"📅 {now_status(s.get('today', {}).get(u['grp']))}\n"
-        f"{_crowd_line(await db.report_stats(u['grp']), chat)}"
+        f"{_crowd_line(await db.report_stats(u['grp'], provider=p), chat)}"
     )
-    if a := await db.latest_alert(u["grp"]):
+    if a := await db.latest_alert(u["grp"], provider=p):
         text += f"\n\n📣 <b>З каналів</b> ({_ago(a['ts'])}):\n{a['text']}"
     await edit(cb, text, kb.simple_kb("now"))
 
@@ -109,10 +136,10 @@ async def now(cb: CallbackQuery):
 @router.callback_query(kb.Nav.filter(F.to == "chats"))
 async def chats(cb: CallbackQuery):
     u = await db.get_user(cb.from_user.id)
-    stats = await db.chat_stats()
+    stats = await db.chat_stats(provider=_prov(u))
     head = "💬 <b>Що пишуть люди</b> <i>(не перевірено)</i>\n\n"
     if stats:
-        head += "За 30 хв по групах:\n" + "\n".join(
+        head += f"За 30 хв по групах ({_pname(u)}):\n" + "\n".join(
             f"{'👉 ' if g == u['grp'] else ''}<b>{g}</b>: 🕯 {c.get('off', 0)}  💡 {c.get('on', 0)}"
             for g, c in sorted(stats.items())
         ) + "\n\n"
@@ -123,7 +150,8 @@ async def chats(cb: CallbackQuery):
         lines = []
         for r in msgs:
             street = f"вул. {r['street']}" if r.get("street") else ""
-            tags = " · ".join(x for x in (r.get("grp") or "", r["district"] or "", street) if x)
+            prov = "ЦЕК" if r.get("provider") == "cek" else ""
+            tags = " · ".join(x for x in (prov, r.get("grp") or "", r["district"] or "", street) if x)
             lines.append(
                 f"{ICON.get(r['event'], '❔')} {f'<b>{escape(tags)}</b> · ' if tags else ''}{_ago(r['ts'])}\n"
                 f"<i>{escape(r['text'][:120])}</i>"
@@ -137,8 +165,8 @@ async def report_menu(cb: CallbackQuery):
     if not (u := await _need_group(cb)):
         return
     text = (
-        f"🙋 <b>Як у тебе зараз?</b> · група <b>{u['grp']}</b>\n\n"
-        f"{_crowd_line(await db.report_stats(u['grp']))}\n\nТвій звіт допоможе сусідам."
+        f"🙋 <b>Як у тебе зараз?</b> · {_pname(u)} · група <b>{u['grp']}</b>\n\n"
+        f"{_crowd_line(await db.report_stats(u['grp'], provider=_prov(u)))}\n\nТвій звіт допоможе сусідам."
     )
     await edit(cb, text, kb.report_kb())
 
@@ -147,15 +175,17 @@ async def report_menu(cb: CallbackQuery):
 async def report(cb: CallbackQuery, callback_data: kb.Report):
     if not (u := await _need_group(cb)):
         return
-    await db.add_report(cb.from_user.id, u["grp"], callback_data.status)
-    text = f"✅ Дякую! Записав: {ICON[callback_data.status]}\n\n{_crowd_line(await db.report_stats(u['grp']))}"
-    await edit(cb, text, kb.report_kb())
+    await db.add_report(cb.from_user.id, u["grp"], callback_data.status, _prov(u))
+    stats = await db.report_stats(u["grp"], provider=_prov(u))
+    await edit(cb, f"✅ Дякую! Записав: {ICON[callback_data.status]}\n\n{_crowd_line(stats)}", kb.report_kb())
+
+
+SETTINGS_TEXT = "⚙️ <b>Налаштування</b>\n\nЗа скільки хвилин попереджати про відключення:"
 
 
 @router.callback_query(kb.Nav.filter(F.to == "settings"))
 async def settings(cb: CallbackQuery):
-    u = await db.get_user(cb.from_user.id)
-    await edit(cb, "⚙️ <b>Налаштування</b>\n\nЗа скільки хвилин попереджати про відключення:", kb.settings_kb(u))
+    await edit(cb, SETTINGS_TEXT, kb.settings_kb(await db.get_user(cb.from_user.id)))
 
 
 @router.callback_query(kb.Notify.filter())
@@ -165,5 +195,4 @@ async def notify(cb: CallbackQuery, callback_data: kb.Notify):
         await db.set_user(cb.from_user.id, notify_on=0 if u["notify_on"] else 1)
     else:
         await db.set_user(cb.from_user.id, notify_min=callback_data.value, notify_on=1)
-    u = await db.get_user(cb.from_user.id)
-    await edit(cb, "⚙️ <b>Налаштування</b>\n\nЗа скільки хвилин попереджати про відключення:", kb.settings_kb(u))
+    await edit(cb, SETTINGS_TEXT, kb.settings_kb(await db.get_user(cb.from_user.id)))

@@ -13,6 +13,10 @@ class SetGroup(CallbackData, prefix="grp"):
     code: str
 
 
+class SetProvider(CallbackData, prefix="prv"):
+    code: str  # dtek | cek
+
+
 class Report(CallbackData, prefix="rep"):
     status: str  # on | off
 
@@ -36,13 +40,15 @@ def main_menu():
     return b.as_markup()
 
 
-def groups_kb(current: str | None):
+def groups_kb(current: str | None, provider: str = "dtek"):
     b = InlineKeyboardBuilder()
+    for code, name in (("dtek", "ДТЕК"), ("cek", "ЦЕК")):
+        b.button(text=f"✅ {name}" if code == provider else name, callback_data=SetProvider(code=code))
     for g in GROUPS:
         b.button(text=f"✅ {g}" if g == current else g, callback_data=SetGroup(code=g))
     if current:
         _back(b)
-    b.adjust(4)
+    b.adjust(2, 4, 4, 4, 1)
     return b.as_markup()
 
 
@@ -74,7 +80,8 @@ def report_kb():
 
 def settings_kb(user: dict):
     b = InlineKeyboardBuilder()
-    b.button(text=f"🔢 Група: {user['grp'] or '—'}", callback_data=Nav(to="groups"))
+    prov = "ЦЕК" if user.get("provider") == "cek" else "ДТЕК"
+    b.button(text=f"🔢 {prov} · група {user['grp'] or '—'}", callback_data=Nav(to="groups"))
     b.button(
         text="🔔 Сповіщення: увімк" if user["notify_on"] else "🔕 Сповіщення: вимк",
         callback_data=Notify(value=0),

@@ -1,17 +1,17 @@
-"""Фонові сповіщення: перед відключенням і при зміні графіка."""
+"""Фонові сповіщення: перед відключенням, при зміні графіка, аварії з каналів, «люди пишуть»."""
 import asyncio
 import logging
 import time
-from html import escape
 from datetime import datetime, timedelta
+from html import escape
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError
 
 import db
 import keyboards as kb
-from config import CROWD_MIN, TZ
 import providers
+from config import CROWD_MIN, TZ
 from providers import get_schedule
 from render import day_text, hm, now_h
 
@@ -24,6 +24,19 @@ def _slots_str(slots) -> str:
     return ", ".join(parts) or "без відключень"
 
 
+def _pkey(provider: str, name: str) -> str:
+    """Ключі kv: у ДТЕК — старі (без префікса), щоб після деплою не було хибних «оновився»."""
+    return name if provider == "dtek" else f"{provider}_{name}"
+
+
+def _prov(user: dict) -> str:
+    return user.get("provider") or "dtek"
+
+
+def _matches(alert_provider: str, user: dict) -> bool:
+    return alert_provider == "*" or alert_provider == _prov(user)
+
+
 async def _send(bot: Bot, uid: int, text: str):
     try:
         await bot.send_message(uid, text, reply_markup=kb.main_menu())
@@ -34,54 +47,59 @@ async def _send(bot: Bot, uid: int, text: str):
 
 
 async def tick(bot: Bot):
-    sch = await get_schedule()
     today = datetime.now(TZ).date()
     dates = {"today": today, "tomorrow": today + timedelta(days=1)}
     users = await db.users_with_group()
     t = now_h()
-
-    # 1) графік оновився / з'явився графік на завтра -> шлемо новий графік
     initialized = await db.kv_get("sched_init") is not None  # перший прохід після деплою — без пушів
-    changes: dict[str, list[str]] = {}  # grp -> готові тексти
-    for day, d in dates.items():
-        for grp, slots in sch.get(day, {}).items():
-            key, new = f"sched:{d}:{grp}", _slots_str(slots)
-            old = await db.kv_get(key)
-            if old == new:
-                continue
-            await db.kv_set(key, new)
-            if not initialized:
-                continue
-            title = "Сьогодні" if day == "today" else "Завтра"
-            if old is None:
-                head = f"📅 <b>З'явився графік на {'завтра' if day == 'tomorrow' else 'сьогодні'}</b>"
-            else:
-                head = f"🔄 <b>Графік на {title.lower()} оновився</b>\nБуло: {old}\nСтало: <b>{new}</b>"
-            text = f"{head}\n\n{day_text(grp, slots, title)}"
-            if providers.last_update:
-                text += f"\n\n🕒 Оновлено ДТЕК: {providers.last_update}"
-            changes.setdefault(grp, []).append(text)
-    if not initialized and any(sch.get(d) for d in dates):
-        await db.kv_set("sched_init", "1")
 
-    for u in users:
-        if not u["notify_on"]:
-            continue
-        for text in changes.get(u["grp"], []):
-            await _send(bot, u["id"], text)
-            await asyncio.sleep(0.05)
+    for prov in db.PROVIDERS:
+        sch = await get_schedule(provider=prov)
+        label = await providers.update_label(prov)
+        name = db.PROVIDER_NAME[prov]
 
-        # 2) попередження перед відключенням
-        for s in sch.get("today", {}).get(u["grp"], []):
-            if s.kind != "off":
+        # 1) графік оновився / з'явився -> шлемо новий графік
+        changes: dict[str, list[str]] = {}  # grp -> готові тексти
+        for day, d in dates.items():
+            for grp, slots in sch.get(day, {}).items():
+                key, new = f"{_pkey(prov, 'sched')}:{d}:{grp}", _slots_str(slots)
+                old = await db.kv_get(key)
+                if old == new:
+                    continue
+                await db.kv_set(key, new)
+                if not initialized:
+                    continue
+                title = "Сьогодні" if day == "today" else "Завтра"
+                if old is None:
+                    head = f"📅 <b>{name}: з'явився графік на {title.lower()}</b>"
+                else:
+                    head = f"🔄 <b>{name}: графік на {title.lower()} оновився</b>\nБуло: {old}\nСтало: <b>{new}</b>"
+                text = f"{head}\n\n{day_text(grp, slots, title)}"
+                if label:
+                    text += f"\n\n{label}"
+                changes.setdefault(grp, []).append(text)
+        if prov == "dtek" and not initialized and any(sch.get(d) for d in dates):
+            await db.kv_set("sched_init", "1")
+
+        for u in users:
+            if not u["notify_on"] or _prov(u) != prov:
                 continue
-            left = (s.start - t) * 60
-            if 0 <= left <= u["notify_min"] and await db.mark_sent(f"warn:{today}:{u['id']}:{s.start}"):
-                await _send(bot, u["id"], f"🔔 Через {int(left)} хв вимкнуть світло ({hm(s.start)}–{hm(s.end)}). Заряджай павербанк!")
+            for text in changes.get(u["grp"], []):
+                await _send(bot, u["id"], text)
+                await asyncio.sleep(0.05)
+            # 2) попередження перед відключенням
+            for s in sch.get("today", {}).get(u["grp"], []):
+                if s.kind != "off":
+                    continue
+                left = (s.start - t) * 60
+                if 0 <= left <= u["notify_min"] and await db.mark_sent(f"warn:{today}:{u['id']}:{prov}:{s.start}"):
+                    await _send(
+                        bot, u["id"], f"🔔 Через {int(left)} хв вимкнуть світло ({hm(s.start)}–{hm(s.end)}). Заряджай павербанк!"
+                    )
 
 
 async def send_alerts(bot: Bot):
-    """Події з каналів (юзербот кладе в alerts) -> людям потрібної групи, загальні — всім."""
+    """Події з каналів (юзербот кладе в alerts) -> людям потрібної групи і постачальника, загальні — всім."""
     alerts = await db.pending_alerts()
     if not alerts:
         return
@@ -89,7 +107,7 @@ async def send_alerts(bot: Bot):
     for a in alerts:
         await db.mark_alert_sent(a["key"])
         for u in users:
-            if a["grp"] == "*" or a["grp"] == u["grp"]:
+            if _matches(a.get("provider") or "dtek", u) and (a["grp"] == "*" or a["grp"] == u["grp"]):
                 await _send(bot, u["id"], a["text"] + "\n\n<i>За даними Telegram-каналів</i>")
                 await asyncio.sleep(0.05)  # ліміт Telegram ~30 повідомлень/с
 
@@ -101,50 +119,53 @@ def _now_off_by_schedule(sch, grp) -> bool:
 
 async def crowd_check(bot: Bot):
     """Канал пише «відновлення до 00:00», а люди в чатах вже «дали» -> повідомляємо групу.
-    Пуш лише коли стан групи змінюється (нема -> є або навпаки) і ≥ CROWD_MIN різних людей за 15 хв."""
-    data = await db.crowd(15)
-    if not data:
-        return
-    sch = await get_schedule()
+    Пуш лише коли стан групи змінюється (нема -> є або навпаки) і ≥ CROWD_MIN різних людей за 15 хв.
+    ЦЕК — лише з повідомлень, де прямо згадано ЦЕК (номери груп ті самі, що в ДТЕК)."""
     users = None
-    for grp, c in data.items():
-        n_on, n_off = len(c["on"]), len(c["off"])
-        if n_on >= CROWD_MIN and n_on >= 2 * n_off:
-            new = "on"
-        elif n_off >= CROWD_MIN and n_off >= 2 * n_on:
-            new = "off"
-        else:
+    for prov in db.PROVIDERS:
+        data = await db.crowd(15, prov)
+        if not data:
             continue
-        prev = await db.kv_get(f"crowd:{grp}")
-        if prev is None:  # ще не знаємо — беремо з каналів/графіка
-            a = await db.latest_alert(grp, hours=12)
-            prev = "off" if (a and a["kind"] == "off" and a["grp"] == grp) or _now_off_by_schedule(sch, grp) else "on"
-        if new == prev:
-            continue
-        last_push = int(await db.kv_get(f"crowd_ts:{grp}") or 0)
-        if time.time() - last_push < 20 * 60:  # не смикаємо людей частіше раз на 20 хв
-            continue
-        await db.kv_set(f"crowd:{grp}", new)
-        await db.kv_set(f"crowd_ts:{grp}", str(int(time.time())))
+        sch = await get_schedule(provider=prov)
+        name = db.PROVIDER_NAME[prov]
+        for grp, c in data.items():
+            n_on, n_off = len(c["on"]), len(c["off"])
+            if n_on >= CROWD_MIN and n_on >= 2 * n_off:
+                new = "on"
+            elif n_off >= CROWD_MIN and n_off >= 2 * n_on:
+                new = "off"
+            else:
+                continue
+            skey = _pkey(prov, "crowd")
+            prev = await db.kv_get(f"{skey}:{grp}")
+            if prev is None:  # ще не знаємо — беремо з каналів/графіка
+                a = await db.latest_alert(grp, hours=12, provider=prov)
+                off = (a and a["kind"] == "off" and a["grp"] == grp) or _now_off_by_schedule(sch, grp)
+                prev = "off" if off else "on"
+            if new == prev:
+                continue
+            last_push = int(await db.kv_get(f"{skey}_ts:{grp}") or 0)
+            if time.time() - last_push < 20 * 60:  # не смикаємо людей частіше раз на 20 хв
+                continue
+            await db.kv_set(f"{skey}:{grp}", new)
+            await db.kv_set(f"{skey}_ts:{grp}", str(int(time.time())))
 
-        if new == "on":
-            head = "💡 <b>Люди пишуть: у групі {g} {what}</b>".format(
-                g=grp, what="почали вмикати світло" if n_off else "дали світло"
-            )
-            n = n_on
-        else:
-            head, n = f"🕯 <b>Люди пишуть: у групі {grp} вимкнули світло</b>", n_off
-        text = f"{head}\n👥 {n} людей за 15 хв"
-        if places := [p for p, _ in c["places"].most_common(4)]:
-            text += "\n📍 " + ", ".join(escape(p) for p in places)
-        text += "\n\n<i>Неофіційно — за повідомленнями в чатах</i>"
+            if new == "on":
+                what = "почали вмикати світло" if n_off else "дали світло"
+                head, n = f"💡 <b>Люди пишуть: {name} {grp} — {what}</b>", n_on
+            else:
+                head, n = f"🕯 <b>Люди пишуть: {name} {grp} — вимкнули світло</b>", n_off
+            text = f"{head}\n👥 {n} людей за 15 хв"
+            if places := [p for p, _ in c["places"].most_common(4)]:
+                text += "\n📍 " + ", ".join(escape(p) for p in places)
+            text += "\n\n<i>Неофіційно — за повідомленнями в чатах</i>"
 
-        users = users if users is not None else [u for u in await db.users_with_group() if u["notify_on"]]
-        for u in users:
-            if u["grp"] == grp:
-                await _send(bot, u["id"], text)
-                await asyncio.sleep(0.05)
-        log.info("crowd %s -> %s (%d on / %d off)", grp, new, n_on, n_off)
+            users = users if users is not None else [u for u in await db.users_with_group() if u["notify_on"]]
+            for u in users:
+                if u["grp"] == grp and _prov(u) == prov:
+                    await _send(bot, u["id"], text)
+                    await asyncio.sleep(0.05)
+            log.info("crowd %s %s -> %s (%d on / %d off)", prov, grp, new, n_on, n_off)
 
 
 async def loop(bot: Bot, every=60):

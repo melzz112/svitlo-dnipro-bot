@@ -8,7 +8,9 @@ from dataclasses import dataclass
 
 import httpx
 
-from config import CITY, GROUPS, SOURCE
+from datetime import datetime, timedelta
+
+from config import CITY, GROUPS, SOURCE, TZ
 
 log = logging.getLogger(__name__)
 
@@ -115,8 +117,32 @@ _cache: tuple[float, Schedule] | None = None
 FETCHERS = {"dtek": fetch_dtek, "yasno": fetch_yasno}
 
 
-async def get_schedule(force=False) -> Schedule:
+async def cek_schedule() -> Schedule:
+    """ЦЕК не дає даних на сайті — графік збирає userbot з постів у Telegram-каналах (db.save_cek_schedule)."""
+    import db  # тут, щоб providers не тягнув БД при імпорті
+
+    today = datetime.now(TZ).date()
+    out: Schedule = {}
+    for day, d in (("today", today), ("tomorrow", today + timedelta(days=1))):
+        groups, _ = await db.get_cek_schedule(d.isoformat())
+        out[day] = {g: [Slot(a, b) for a, b in v] for g, v in groups.items()}
+    return out
+
+
+async def update_label(provider="dtek") -> str | None:
+    """Рядок «🕒 Оновлено …» для екрана графіка і пушів."""
+    if provider == "cek":
+        import db
+
+        _, upd = await db.get_cek_schedule(datetime.now(TZ).date().isoformat())
+        return f"🕒 Графік ЦЕК з Telegram-каналів, оновлено {upd}" if upd else None
+    return f"🕒 Оновлено ДТЕК: {last_update}" if last_update else None
+
+
+async def get_schedule(force=False, provider="dtek") -> Schedule:
     """Кеш 5 хв; force (кнопка 🔄) — не частіше раз на хвилину, сторінка ДТЕК ~1 МБ."""
+    if provider == "cek":
+        return await cek_schedule()
     global _cache
     if _cache:
         age = time.time() - _cache[0]

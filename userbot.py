@@ -21,7 +21,7 @@ from telethon.tl.types import ChatInviteAlready, PeerUser
 
 import db
 from config import API_HASH, API_ID, CHANNELS, CHATS, TZ
-from parse import dedup_text, parse_channel, parse_user, ukey
+from parse import dedup_text, parse_cek_schedule, parse_channel, parse_user, ukey
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("userbot")
@@ -33,22 +33,27 @@ def alert_key(a, raw: str) -> str:
         return f"general:{day}:{dedup_text(raw)}"
     # «off» з однаковим «до» — один раз; «on» без часу — не частіше раз на 2 год
     bucket = a.until or f"h{datetime.now(TZ).hour // 2}"
-    return f"{a.kind}:{a.grp}:{day}:{bucket}"
+    return f"{a.provider}:{a.kind}:{a.grp}:{day}:{bucket}"
 
 
 async def handle_post(raw: str):
-    """Пост каналу -> alerts з антиспамом."""
+    """Пост каналу -> графік ЦЕК у БД і/або alerts з антиспамом."""
+    now = datetime.now(TZ)
+    if cek := parse_cek_schedule(raw, now.date()):
+        day, groups = cek
+        await db.save_cek_schedule(day.isoformat(), groups, now.strftime("%H:%M %d.%m"))
+        log.info("CEK schedule %s: %d груп", day, len(groups))
     for a in parse_channel(raw):
         if a.kind == "general":
             # загальних — не частіше раз на 30 хв (крім «скасовано»: це важливо)
-            if "скасован" not in raw.lower() and await db.last_alert("general", "*", 30):
+            if "скасован" not in raw.lower() and await db.last_alert("general", "*", 30, a.provider):
                 continue
         elif a.kind == "off" and a.until:
-            prev = await db.last_alert("off", a.grp, 12 * 60)
+            prev = await db.last_alert("off", a.grp, 12 * 60, a.provider)
             if prev and prev["until"] and ukey(a.until) > ukey(prev["until"]):
                 a.text = a.text.replace("Аварійне/екстрене відключення", "Відключення продовжено")
-        if await db.add_alert(alert_key(a, raw), a.kind, a.grp, a.until, a.text):
-            log.info("ALERT %s %s %s", a.kind, a.grp, a.until)
+        if await db.add_alert(alert_key(a, raw), a.kind, a.grp, a.until, a.text, a.provider):
+            log.info("ALERT %s %s %s %s", a.provider, a.kind, a.grp, a.until)
 
 
 async def resolve(client, names):
@@ -124,7 +129,7 @@ async def main():
         # автора НЕ зберігаємо — лише солоний хеш, щоб рахувати різних людей
         who = hashlib.sha256(f"{API_HASH}:{msg.from_id.user_id}".encode()).hexdigest()[:12]
         await db.add_chat_msg(
-            chat, event.raw_text, res["district"], res["event"], res["groups"], res["street"], who
+            chat, event.raw_text, res["district"], res["event"], res["groups"], res["street"], who, res["provider"]
         )
         log.info("USER %s %s %s | %s", res["event"], res["groups"], res["street"] or "", event.raw_text[:60])
 
