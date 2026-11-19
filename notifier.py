@@ -1,6 +1,5 @@
 """Фонові сповіщення: перед відключенням і при зміні графіка."""
 import asyncio
-import hashlib
 import logging
 import time
 from html import escape
@@ -12,14 +11,17 @@ from aiogram.exceptions import TelegramForbiddenError
 import db
 import keyboards as kb
 from config import CROWD_MIN, TZ
+import providers
 from providers import get_schedule
-from render import hm, now_h
+from render import day_text, hm, now_h
 
 log = logging.getLogger(__name__)
 
 
-def _hash(slots) -> str:
-    return hashlib.md5(repr([(s.start, s.end, s.kind) for s in slots or []]).encode()).hexdigest()
+def _slots_str(slots) -> str:
+    """«06:00–10:00, 16:30–20:30» — і для порівняння, і для «було/стало»."""
+    parts = [f"{'~' if s.kind == 'maybe' else ''}{hm(s.start)}–{hm(s.end)}" for s in sorted(slots or [], key=lambda s: s.start)]
+    return ", ".join(parts) or "без відключень"
 
 
 async def _send(bot: Bot, uid: int, text: str):
@@ -38,22 +40,36 @@ async def tick(bot: Bot):
     users = await db.users_with_group()
     t = now_h()
 
-    # 1) зміна графіка
-    changed: dict[str, list[str]] = {}
+    # 1) графік оновився / з'явився графік на завтра -> шлемо новий графік
+    initialized = await db.kv_get("sched_init") is not None  # перший прохід після деплою — без пушів
+    changes: dict[str, list[str]] = {}  # grp -> готові тексти
     for day, d in dates.items():
         for grp, slots in sch.get(day, {}).items():
-            key, h = f"hash:{d}:{grp}", _hash(slots)
+            key, new = f"sched:{d}:{grp}", _slots_str(slots)
             old = await db.kv_get(key)
-            if old != h:
-                await db.kv_set(key, h)
-                if old is not None:
-                    changed.setdefault(grp, []).append("сьогодні" if day == "today" else "завтра")
+            if old == new:
+                continue
+            await db.kv_set(key, new)
+            if not initialized:
+                continue
+            title = "Сьогодні" if day == "today" else "Завтра"
+            if old is None:
+                head = f"📅 <b>З'явився графік на {'завтра' if day == 'tomorrow' else 'сьогодні'}</b>"
+            else:
+                head = f"🔄 <b>Графік на {title.lower()} оновився</b>\nБуло: {old}\nСтало: <b>{new}</b>"
+            text = f"{head}\n\n{day_text(grp, slots, title)}"
+            if providers.last_update:
+                text += f"\n\n🕒 Оновлено ДТЕК: {providers.last_update}"
+            changes.setdefault(grp, []).append(text)
+    if not initialized and any(sch.get(d) for d in dates):
+        await db.kv_set("sched_init", "1")
 
     for u in users:
         if not u["notify_on"]:
             continue
-        if u["grp"] in changed:
-            await _send(bot, u["id"], f"⚠️ Графік для групи <b>{u['grp']}</b> змінився ({', '.join(changed[u['grp']])})")
+        for text in changes.get(u["grp"], []):
+            await _send(bot, u["id"], text)
+            await asyncio.sleep(0.05)
 
         # 2) попередження перед відключенням
         for s in sch.get("today", {}).get(u["grp"], []):
