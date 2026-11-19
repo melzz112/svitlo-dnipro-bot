@@ -30,7 +30,7 @@ async def _send(bot: Bot, uid: int, text: str):
 
 
 async def tick(bot: Bot):
-    sch = await get_schedule(force=True)
+    sch = await get_schedule()
     today = datetime.now(TZ).date()
     dates = {"today": today, "tomorrow": today + timedelta(days=1)}
     users = await db.users_with_group()

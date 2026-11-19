@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-SOURCE = os.getenv("SOURCE", "yasno")
+SOURCE = os.getenv("SOURCE", "dtek")
 CITY = os.getenv("CITY", "dnipro")
 DB_PATH = os.getenv("DB_PATH", "svitlo.db")
 TZ = ZoneInfo("Europe/Kyiv")

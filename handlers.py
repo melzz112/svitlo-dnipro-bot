@@ -8,6 +8,7 @@ from aiogram.types import CallbackQuery, Message
 
 import db
 import keyboards as kb
+import providers
 from providers import get_schedule
 from render import day_text, now_status
 
@@ -70,7 +71,10 @@ async def sched(cb: CallbackQuery, callback_data: kb.Nav):
     day, _, refresh = callback_data.arg.partition("-")
     s = await get_schedule(force=bool(refresh))
     title = "Сьогодні" if day == "today" else "Завтра"
-    await edit(cb, day_text(u["grp"], s.get(day, {}).get(u["grp"]), title), kb.sched_kb(day))
+    text = day_text(u["grp"], s.get(day, {}).get(u["grp"]), title)
+    if providers.last_update:
+        text += f"\n\n🕒 Оновлено ДТЕК: {providers.last_update}"
+    await edit(cb, text, kb.sched_kb(day))
 
 
 def _crowd_line(stats: dict) -> str:

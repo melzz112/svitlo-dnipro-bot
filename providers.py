@@ -1,6 +1,8 @@
 """Джерела графіків. Формат: {"today": {"1.1": [Slot,...], ...}, "tomorrow": {...}}"""
+import json
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass
 
@@ -21,6 +23,58 @@ class Slot:
 Schedule = dict[str, dict[str, list[Slot]]]
 
 YASNO_URL = "https://api.yasno.com.ua/api/v1/pages/home/schedule-turn-off-electricity"
+DTEK_URL = "https://www.dtek-dnem.com.ua/ua/shutdowns"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+
+last_update: str | None = None  # "19.11.2026 21:01" з сайту ДТЕК
+
+# Значення години в JSON ДТЕК -> які півгодини без світла і якого типу
+_DTEK_HALVES = {
+    "no": ("off", "off"),
+    "first": ("off", None),
+    "second": (None, "off"),
+    "maybe": ("maybe", "maybe"),
+    "mfirst": ("maybe", None),
+    "msecond": (None, "maybe"),
+}
+
+
+def parse_dtek_hours(hours: dict[str, str]) -> list[Slot]:
+    """{"1": "yes", "2": "no", ...} (година 1 = 00:00–01:00) -> злиті інтервали."""
+    halves: list[str | None] = []
+    for h in range(1, 25):
+        halves.extend(_DTEK_HALVES.get(hours.get(str(h), "yes"), (None, None)))
+    slots: list[Slot] = []
+    for i, kind in enumerate(halves):
+        if kind is None:
+            continue
+        if slots and slots[-1].kind == kind and slots[-1].end == i / 2:
+            slots[-1].end = (i + 1) / 2
+        else:
+            slots.append(Slot(i / 2, (i + 1) / 2, kind))
+    return slots
+
+
+async def fetch_dtek() -> Schedule:
+    global last_update
+    async with httpx.AsyncClient(timeout=30, headers={"User-Agent": UA}, follow_redirects=True) as c:
+        r = await c.get(DTEK_URL)
+        r.raise_for_status()
+    m = re.search(r"DisconSchedule\.fact\s*=\s*(\{.*?\})\s*</script>", r.text, re.S)
+    if not m:
+        raise ValueError("DisconSchedule.fact не знайдено на сторінці ДТЕК")
+    fact = json.loads(m.group(1))
+    last_update = fact.get("update")
+    today = int(fact["today"])
+    data = fact.get("data", {})
+    out: Schedule = {}
+    for day, ts in (("today", today), ("tomorrow", today + 86400)):
+        groups = data.get(str(ts))
+        if groups:
+            out[day] = {g.removeprefix("GPV"): parse_dtek_hours(h) for g, h in groups.items()}
+        else:
+            out[day] = {}
+    return out
 
 
 async def fetch_yasno() -> Schedule:
@@ -58,19 +112,25 @@ def demo_schedule() -> Schedule:
 _cache: tuple[float, Schedule] | None = None
 
 
+FETCHERS = {"dtek": fetch_dtek, "yasno": fetch_yasno}
+
+
 async def get_schedule(force=False) -> Schedule:
+    """Кеш 5 хв; force (кнопка 🔄) — не частіше раз на хвилину, сторінка ДТЕК ~1 МБ."""
     global _cache
-    if not force and _cache and time.time() - _cache[0] < 300:
-        return _cache[1]
+    if _cache:
+        age = time.time() - _cache[0]
+        if age < 60 or (not force and age < 300):
+            return _cache[1]
     if SOURCE == "demo":
         sch = demo_schedule()
     else:
         try:
-            sch = await fetch_yasno()
-        except Exception as e:  # API змінилось/лежить — не падаємо
-            log.warning("YASNO fetch failed: %r", e)
+            sch = await FETCHERS.get(SOURCE, fetch_dtek)()
+        except Exception as e:  # сайт змінився/лежить — не падаємо
+            log.warning("%s fetch failed: %r", SOURCE, e)
             if _cache:
                 return _cache[1]
-            sch = {"today": {}, "tomorrow": {}}
+            return {"today": {}, "tomorrow": {}}
     _cache = (time.time(), sch)
     return sch
