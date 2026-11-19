@@ -77,10 +77,17 @@ async def sched(cb: CallbackQuery, callback_data: kb.Nav):
     await edit(cb, text, kb.sched_kb(day))
 
 
-def _crowd_line(stats: dict) -> str:
-    if not stats:
+def _crowd_line(stats: dict, chat: dict | None = None) -> str:
+    chat = chat or {}
+    off, on = stats.get("off", 0) + chat.get("off", 0), stats.get("on", 0) + chat.get("on", 0)
+    if not off and not on:
         return "👥 Звітів від людей за 30 хв немає"
-    return f"👥 За 30 хв: 🕯 нема — {stats.get('off', 0)}, 💡 є — {stats.get('on', 0)}"
+    return f"👥 Люди за 30 хв (бот + чати): 🕯 нема — {off}, 💡 є — {on}"
+
+
+def _ago(ts: int) -> str:
+    m = (int(time.time()) - ts) // 60
+    return f"{m} хв тому" if m < 60 else f"{m // 60} год {m % 60} хв тому"
 
 
 @router.callback_query(kb.Nav.filter(F.to == "now"))
@@ -88,29 +95,41 @@ async def now(cb: CallbackQuery):
     if not (u := await _need_group(cb)):
         return
     s = await get_schedule()
-    msgs = await db.recent_chat_msgs(hours=1, limit=50)
+    chat = (await db.chat_stats()).get(u["grp"])
     text = (
         f"⚡ <b>Зараз</b> · група <b>{u['grp']}</b>\n\n"
-        f"{now_status(s.get('today', {}).get(u['grp']))}\n"
-        f"{_crowd_line(await db.report_stats(u['grp']))}\n"
-        f"💬 Згадок у чатах за годину: {len(msgs)}"
+        f"📅 {now_status(s.get('today', {}).get(u['grp']))}\n"
+        f"{_crowd_line(await db.report_stats(u['grp']), chat)}"
     )
+    if a := await db.latest_alert(u["grp"]):
+        text += f"\n\n📣 <b>З каналів</b> ({_ago(a['ts'])}):\n{a['text']}"
     await edit(cb, text, kb.simple_kb("now"))
 
 
 @router.callback_query(kb.Nav.filter(F.to == "chats"))
 async def chats(cb: CallbackQuery):
+    u = await db.get_user(cb.from_user.id)
+    stats = await db.chat_stats()
+    head = "💬 <b>Що пишуть люди</b> <i>(не перевірено)</i>\n\n"
+    if stats:
+        head += "За 30 хв по групах:\n" + "\n".join(
+            f"{'👉 ' if g == u['grp'] else ''}<b>{g}</b>: 🕯 {c.get('off', 0)}  💡 {c.get('on', 0)}"
+            for g, c in sorted(stats.items())
+        ) + "\n\n"
     msgs = await db.recent_chat_msgs()
     if not msgs:
-        text = "💬 <b>Що пишуть у чатах</b>\n\nЗа останні 2 год нічого релевантного."
+        text = head + "За останні 2 год повідомлень немає."
     else:
         lines = []
         for r in msgs:
-            ago = (int(time.time()) - r["ts"]) // 60
-            where = f"<b>{escape(r['district'])}</b> · " if r["district"] else ""
-            lines.append(f"{ICON.get(r['event'], '❔')} {where}{ago} хв тому\n<i>{escape(r['text'][:160])}</i>")
-        text = "💬 <b>Що пишуть у чатах</b> <i>(не перевірено)</i>\n\n" + "\n\n".join(lines)
-    await edit(cb, text, kb.simple_kb("chats"))
+            street = f"вул. {r['street']}" if r.get("street") else ""
+            tags = " · ".join(x for x in (r.get("grp") or "", r["district"] or "", street) if x)
+            lines.append(
+                f"{ICON.get(r['event'], '❔')} {f'<b>{escape(tags)}</b> · ' if tags else ''}{_ago(r['ts'])}\n"
+                f"<i>{escape(r['text'][:120])}</i>"
+            )
+        text = head + "\n".join(lines)
+    await edit(cb, text[:4000], kb.simple_kb("chats"))
 
 
 @router.callback_query(kb.Nav.filter(F.to == "report"))

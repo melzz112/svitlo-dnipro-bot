@@ -13,7 +13,13 @@ TZ = ZoneInfo("Europe/Kyiv")
 
 API_ID = int(os.getenv("API_ID") or 0)
 API_HASH = os.getenv("API_HASH", "")
-CHATS = [c.strip() for c in os.getenv("CHATS", "").split(",") if c.strip()]
+def _list(name):
+    return [c.strip() for c in os.getenv(name, "").split(",") if c.strip()]
+
+
+CHANNELS = _list("CHANNELS")  # канали-агрегатори: пости -> сповіщення; їх коментарі -> звіти людей
+CHATS = _list("CHATS")  # додаткові чати, де пишуть люди
+CROWD_MIN = int(os.getenv("CROWD_MIN") or 3)  # скільки різних людей за 15 хв = «люди пишуть, що дали»
 
 GROUPS = [f"{q}.{s}" for q in range(1, 7) for s in (1, 2)]  # 1.1 … 6.2
 

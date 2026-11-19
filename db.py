@@ -17,6 +17,9 @@ CREATE TABLE IF NOT EXISTS reports(
 CREATE TABLE IF NOT EXISTS chat_msgs(
     chat TEXT, text TEXT, district TEXT, event TEXT, ts INTEGER
 );
+CREATE TABLE IF NOT EXISTS alerts(
+    key TEXT PRIMARY KEY, kind TEXT, grp TEXT, until TEXT, text TEXT, ts INTEGER, sent INTEGER DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS sent(key TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
 """
@@ -26,6 +29,11 @@ async def init():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.executescript(SCHEMA)
+        for col in ("grp", "street", "who"):  # міграції chat_msgs
+            try:
+                await db.execute(f"ALTER TABLE chat_msgs ADD COLUMN {col} TEXT DEFAULT ''")
+            except aiosqlite.OperationalError:
+                pass
         await db.commit()
 
 
@@ -76,8 +84,83 @@ async def report_stats(grp, minutes=30):
 
 
 # --- chat messages ---
-async def add_chat_msg(chat, text, district, event):
-    await _exec("INSERT INTO chat_msgs VALUES(?,?,?,?,?)", (chat, text, district, event, int(time.time())))
+async def add_chat_msg(chat, text, district, event, groups=(), street=None, who=""):
+    """who — хеш автора (не сам ID): щоб рахувати різних людей, а не повідомлення."""
+    await _exec(
+        "INSERT INTO chat_msgs(chat, text, district, event, ts, grp, street, who) VALUES(?,?,?,?,?,?,?,?)",
+        (chat, text, district, event, int(time.time()), ",".join(groups), street or "", who),
+    )
+
+
+async def crowd(minutes=15):
+    """По групах: різні люди «є»/«нема» з чатів і з кнопок бота + згадані райони/вулиці.
+    {"1.2": {"on": {who,...}, "off": {...}, "places": Counter}}"""
+    from collections import Counter
+
+    since = int(time.time()) - minutes * 60
+    out: dict = {}
+
+    def slot(g):
+        return out.setdefault(g, {"on": set(), "off": set(), "places": Counter()})
+
+    for r in await _all("SELECT * FROM chat_msgs WHERE ts>=? AND grp!=''", (since,)):
+        for g in r["grp"].split(","):
+            s = slot(g)
+            s[r["event"]].add(r["who"] or f"m{r['ts']}{r['text'][:20]}")
+            for p in (r["district"], r["street"]):
+                if p and r["event"] == "on":
+                    s["places"][p] += 1
+    for r in await _all("SELECT * FROM reports WHERE ts>=?", (since,)):
+        slot(r["grp"])[r["status"]].add(f"bot{r['user_id']}")
+    return out
+
+
+async def chat_stats(minutes=30):
+    """{"1.1": {"off": 5, "on": 1}, ...} — звіти людей з чатів по групах."""
+    since = int(time.time()) - minutes * 60
+    out: dict[str, dict[str, int]] = {}
+    for r in await _all("SELECT grp, event FROM chat_msgs WHERE ts>=? AND grp!=''", (since,)):
+        for g in r["grp"].split(","):
+            out.setdefault(g, {}).setdefault(r["event"], 0)
+            out[g][r["event"]] += 1
+    return out
+
+
+# --- alerts з каналів ---
+async def add_alert(key, kind, grp, until, text) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO alerts(key, kind, grp, until, text, ts) VALUES(?,?,?,?,?,?)",
+            (key, kind, grp, until, text, int(time.time())),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def pending_alerts(max_age_min=30):
+    since = int(time.time()) - max_age_min * 60
+    await _exec("UPDATE alerts SET sent=1 WHERE sent=0 AND ts<?", (since,))  # старе не розсилаємо
+    return await _all("SELECT * FROM alerts WHERE sent=0 ORDER BY ts")
+
+
+async def mark_alert_sent(key):
+    await _exec("UPDATE alerts SET sent=1 WHERE key=?", (key,))
+
+
+async def last_alert(kind, grp, minutes):
+    since = int(time.time()) - int(minutes * 60)
+    rows = await _all(
+        "SELECT * FROM alerts WHERE kind=? AND grp=? AND ts>=? ORDER BY ts DESC LIMIT 1", (kind, grp, since)
+    )
+    return rows[0] if rows else None
+
+
+async def latest_alert(grp, hours=6):
+    since = int(time.time()) - hours * 3600
+    rows = await _all(
+        "SELECT * FROM alerts WHERE (grp=? OR grp='*') AND ts>=? ORDER BY ts DESC LIMIT 1", (grp, since)
+    )
+    return rows[0] if rows else None
 
 
 async def recent_chat_msgs(hours=2, limit=12):
