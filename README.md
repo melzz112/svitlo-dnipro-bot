@@ -27,7 +27,8 @@
 а нагадування «через 15 хв вимкнуть» не надсилаються. Перевірити, чи покриті всі групи: `python dtek_site.py`.
 
 Файли: `providers.py` (графіки), `dtek_site.py` (екстрені по групах і будинках з сайту ДТЕК),
-`address.py` (геопозиція/текст -> вулиця й будинок), `parse.py` (розбір чатів + цензура),
+`address.py` (геопозиція/текст -> вулиця й будинок), `cek_site.py` (стрічка «Відключення» на сайті ЦЕК: графік ГПВ,
+«додатково відключаються черги», екстрені; поки не підключений як джерело — `python cek_site.py`), `parse.py` (розбір чатів + цензура),
 `handlers.py`/`keyboards.py` (меню), `notifier.py` (пуші), `db.py` (SQLite).
 
 Тести: `PYTHONPATH=. python -m unittest discover -s tests -p "test_*.py"`, а також `python tests/test_parse_live.py`
