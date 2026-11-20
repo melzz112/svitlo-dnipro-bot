@@ -191,11 +191,20 @@ class SiteAlertTests(DbTestCase):
         data = {str(n): house() for n in range(1, 11)} | {"11": house(EMERGENCY, "13:16 20.11.2026", "17:16 20.11.2026")}
         self.assertEqual(await self.check({"data": data}), [])
 
-    async def test_people_saying_on_beat_an_old_alert(self):
+    async def test_people_saying_on_during_official_outage(self):
+        """Офіційно екстрене до 17:16: «світло є» не пишемо — вмикають поступово (скрін 20.11, 16:42)."""
         await self.check(street_payload())
-        for who in "abc":
+        for who in "abc":  # троє «дали» — ще не новина
             await db.add_chat_msg("chat", "1.2 дали", None, "on", ["1.2"], who=who)
-        self.assertIn("🟢", await self.verdict())
+        text = await self.verdict()
+        self.assertNotIn("🟢", text)
+        self.assertIn("🔴 <b>Світла немає</b>", text)
+        self.assertIn("дехто пише, що дали", text)
+        for who in "de":  # п'ятеро — «частково», але все одно не «є»
+            await db.add_chat_msg("chat", "1.2 дали", None, "on", ["1.2"], who=who)
+        text = await self.verdict()
+        self.assertIn("🟡 <b>Частково є світло</b>", text)
+        self.assertNotIn("🟢", text)
 
 
 class CityEmergencyTests(DbTestCase):

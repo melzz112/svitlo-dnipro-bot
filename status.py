@@ -88,91 +88,120 @@ def _ago(ts: float) -> str:
     return f"{m} хв тому" if m < 60 else f"{m // 60} год {m % 60} хв тому"
 
 
-def _emergency_head(n_on: int, n_off: int, alert: dict | None) -> tuple[str, str]:
-    """Офіційно екстрене по групі (сайт ДТЕК / канали) або екстрені в усьому місті: «нема», поки люди
-    масово не пишуть «дали» (рахуються лише голоси з початку відключення)."""
-    if n_on >= 2 and n_off == 0:
-        return "🟢 <b>Світло є</b>", "люди пишуть, що дали"
-    if n_on >= 2 and n_on >= 3 * n_off:
-        return "🟢 <b>Світло є у більшості</b>", "дехто ще пише, що немає"
-    if n_on >= 2 and n_on >= n_off:
-        return "🟡 <b>Частково є світло</b>", "багатьом дали, але не всім"
-    confirmed = " · люди підтверджують" if n_off >= 2 else ""
-    if alert:
-        return "🔴 <b>Світла немає</b>", _label(alert["text"]) + confirmed
-    if n_off and n_off > n_on:
-        return "🔴 <b>Світла немає</b>", "екстрені відключення" + confirmed
-    return "🟠 <b>Екстрені відключення</b>", "світло можуть вимкнути будь-якої миті"
+ON_PARTIAL_MIN = 5  # стільки різних людей «дали», щоб під час офіційного відключення сказати «частково є світло»
+OFF_LOCAL_MIN = 3  # стільки «нема» після офіційного кінця, щоб сказати «світла немає» (локальна аварія / затримка)
 
 
-async def verdict(grp: str, provider: str) -> str:
-    now = datetime.now(TZ)
-    sch = await get_schedule(provider=provider)
-    city_em = await db.get_emergency(provider)  # у місті діють екстрені — графік не діє
+def _hm_ts(ts: float) -> str:
+    return datetime.fromtimestamp(ts, TZ).strftime("%H:%M")
+
+
+async def official_outage(grp: str, provider: str, sch: dict | None = None, now: datetime | None = None):
+    """Офіційно зараз відключення? -> (алерт з каналів/сайту ДТЕК або None, поточний слот графіка або None,
+    час початку відключення, «до HH:MM» текстом). Під час екстрених у місті графік не діє — слот не враховуємо."""
+    now = now or datetime.now(TZ)
+    sch = sch if sch is not None else await get_schedule(provider=provider)
+    city_em = await db.get_emergency(provider)
     t = now_h()
     slot = None if city_em else next(
         (s for s in sch.get("today", {}).get(grp, []) if s.kind == "off" and s.start <= t < s.end), None
     )
     alert, alert_start = await _outage_chain(grp, provider, now)
-
-    # з якого моменту рахуємо голоси людей
     starts = []
     if alert_start:
         starts.append(alert_start)
     if slot:
         midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
         starts.append((midnight + timedelta(hours=slot.start)).timestamp())
-    since = min(starts) if starts else now.timestamp() - NO_OUTAGE_WINDOW
-    since = max(since, now.timestamp() - MAX_WINDOW)
-
-    people = await db.crowd_people(grp, provider, since)
-    on_ts = [ts for ev, ts in people.values() if ev == "on"]
-    off_ts = [ts for ev, ts in people.values() if ev == "off"]
-    if len(on_ts) >= 2:
-        # «вирубили» о 06:16, а з 07:19 люди пишуть «дали» — ранні «нема» вже застарілі
-        # (ці люди просто не написали вдруге). Рахуємо «нема», написані після першого «дали».
-        first_on = min(on_ts)
-        off_ts = [ts for ts in off_ts if ts >= first_on]
-    n_on, n_off = len(on_ts), len(off_ts)
-
-    # 1) підсумок (великий рядок) + пояснення: люди важать більше за графік/канали, коли їх хоча б двоє
-    today_slots = sch.get("today", {}).get(grp)
-    if alert or city_em:
-        head, sub = _emergency_head(n_on, n_off, alert)
-    elif n_on >= 2 and n_off == 0:
-        head, sub = "🟢 <b>Світло є</b>", "люди пишуть, що дали"
-    elif n_on >= 2 and n_on >= 3 * n_off:
-        head, sub = "🟢 <b>Світло є у більшості</b>", "дехто ще пише, що немає"
-    elif n_on >= 2 and n_off >= 1 and n_on >= n_off:
-        head, sub = "🟡 <b>Частково є світло</b>", "багатьом дали, але не всім"
-    elif n_off >= 2 and n_on >= 1:
-        head, sub = "🟡 <b>Здебільшого немає</b>", "лише частині адрес дали"
-    elif n_off >= 2:
-        head, sub = "🔴 <b>Світла немає</b>", "люди підтверджують"
-    elif n_on == 1 and n_off == 1:
-        head, sub = "🟡 <b>Неоднозначно</b>", "повідомлення розходяться"
+    if alert and alert["until"]:
+        until = _short_until(alert["until"], now)
     elif slot:
-        head, sub = "🔴 <b>Світла немає</b>", "за графіком"
-    elif today_slots is None:
-        head, sub = "❔ <b>Невідомо</b>", "графіка немає, люди не пишуть"
+        until = hm(slot.end)
     else:
-        head, sub = "🟢 <b>Світло має бути</b>", "за графіком зараз без відключень"
+        until = None
+    return alert, slot, (min(starts) if starts else None), until
+
+
+async def _recent_end(grp: str, provider: str, sch: dict, now: datetime) -> float | None:
+    """Коли (за останні 3 год) офіційно скінчилось відключення групи: «до …» аварії минуло, сайт ДТЕК написав
+    «екстрене закінчилось» або скінчився слот графіка. None — офіційних відключень останнім часом не було."""
+    ends = []
+    for a in await db.off_alerts(grp, provider):
+        if (end := _until_dt(a["until"], a["ts"])) and end <= now:
+            ends.append(end.timestamp())
+    if ended := await db.last_alert("on", grp, 12 * 60, provider, src="dteksite"):
+        ends.append(ended["ts"])
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    for s in sch.get("today", {}).get(grp, []) or []:
+        if s.kind == "off" and s.end <= now_h():
+            ends.append((midnight + timedelta(hours=s.end)).timestamp())
+    ends = [e for e in ends if e >= now.timestamp() - NO_OUTAGE_WINDOW]
+    return max(ends) if ends else None
+
+
+async def verdict(grp: str, provider: str) -> str:
+    """Офіційний час — головний: поки офіційно відключення, «світло є» не пишемо, навіть якщо кілька людей
+    написали «дали» (вмикають поступово). Люди лише уточнюють: багато «дали» -> «частково», після офіційного
+    кінця «нема» -> «не всі зі світлом»."""
+    now = datetime.now(TZ)
+    sch = await get_schedule(provider=provider)
+    city_em = await db.get_emergency(provider)  # у місті діють екстрені — графік не діє
+    t = now_h()
+    alert, slot, start, until = await official_outage(grp, provider, sch, now)
+    today_slots = sch.get("today", {}).get(grp)
+    note = None
+
+    if alert or slot:
+        # 1) офіційно зараз відключення — голоси з його початку (від кожної людини — останній)
+        people = await db.crowd_people(grp, provider, max(start, now.timestamp() - MAX_WINDOW))
+        n_on = sum(1 for ev, _ in people.values() if ev == "on")
+        n_off = len(people) - n_on
+        till = f" до <b>{until}</b>" if until else ""
+        if n_on >= ON_PARTIAL_MIN and n_on >= 2 * n_off:
+            head, sub = "🟡 <b>Частково є світло</b>", "почали вмикати, але не всім"
+        elif n_on >= 1 and n_on >= n_off:
+            head, sub = "🔴 <b>Світла немає</b>", "дехто пише, що дали — можливо, почали вмикати"
+        else:
+            reason = _label(alert["text"]) if alert else "за графіком"
+            head, sub = "🔴 <b>Світла немає</b>", reason + (" · люди підтверджують" if n_off >= 2 else "")
+    else:
+        # 2) офіційно відключення немає — «нема» рахуємо лише після офіційного кінця (раніші — про саме відключення)
+        end_ts = await _recent_end(grp, provider, sch, now)
+        people = await db.crowd_people(grp, provider, end_ts or now.timestamp() - NO_OUTAGE_WINDOW)
+        n_on = sum(1 for ev, _ in people.values() if ev == "on")
+        n_off = len(people) - n_on
+        till = ""
+        if city_em and n_off >= 2 and n_off > n_on:  # під час екстрених «нема» майже напевно правда
+            head, sub = "🔴 <b>Світла немає</b>", "екстрені відключення · люди підтверджують"
+        elif n_off >= OFF_LOCAL_MIN and n_off > n_on:
+            head, sub = "🔴 <b>Світла немає</b>", "люди пишуть, хоча офіційно відключення немає — можливо, локальна аварія"
+        elif city_em:
+            head, sub = "🟠 <b>Екстрені відключення</b>", "світло можуть вимкнути будь-якої миті"
+        elif end_ts:
+            head, sub = "🟢 <b>Світло є</b>", f"відключення скінчилось о {_hm_ts(end_ts)}"
+        elif today_slots is None and not people:
+            head, sub = "❔ <b>Невідомо</b>", "графіка немає, люди не пишуть"
+        elif today_slots is None and n_on >= 2:
+            head, sub = "🟢 <b>Світло є</b>", "люди пишуть, що дали"
+        else:
+            head, sub = "🟢 <b>Світло має бути</b>", "за графіком зараз без відключень"
+        if n_off and not head.startswith("🔴"):
+            note = f"⚠️ Не всі зі світлом — {n_off} {'пише' if n_off == 1 else 'пишуть'}, що досі нема"
 
     lines = [head, f"<i>{sub}</i>", ""]
-    # 2) факти: люди / офіційно / графік
+    # 3) факти: люди / офіційно / графік
     if n_on or n_off:
         lines.append(f"👥 Люди пишуть:  💡 є — {n_on}  ·  🕯 нема — {n_off}")
+    if note:
+        lines.append(note)
     if alert:
-        until = f" до <b>{_short_until(alert['until'], now)}</b>" if alert["until"] else ""
-        lines.append(f"🚨 Офіційно: {_label(alert['text'])}{until}")
+        lines.append(f"🚨 Офіційно: {_label(alert['text'])}{till}")
         if alert.get("src") == "dteksite" and (m := re.search(r"🏠 ([^\n]*)", alert["text"])):
             lines.append(f"🏠 {m.group(1)} (сайт ДТЕК)")
     elif provider == "dtek" and (share := await _group_share(grp, now)):
         lines.append(share)  # екстрене лише в частини адрес групи — пуш усім не шлемо, але показуємо
     if city_em:
         lines.append("🚨 У Дніпрі діють екстрені відключення — графік зараз не діє")
-    elif not alert and n_off >= 2 and not slot:
-        lines.append("❓ Ні в графіку, ні в каналах відключення немає — можливо, локальна аварія")
     if not city_em and not is_emergency_alert(alert) and (sched_line := _schedule_line(today_slots, slot, t)):
         lines.append(sched_line)
     return "\n".join(lines).rstrip()

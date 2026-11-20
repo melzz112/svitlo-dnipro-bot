@@ -13,6 +13,7 @@ import db
 import dtek_site
 import keyboards as kb
 import providers
+import status
 from config import CITY, CROWD_MIN, DTEK_PROBE_SEC, SOURCE, TZ
 from providers import get_schedule
 from render import day_text, hm, now_h, now_status
@@ -176,7 +177,12 @@ async def crowd_check(bot: Bot):
         min_off = min(CROWD_MIN, 2) if emergency else CROWD_MIN
         for grp, c in data.items():
             n_on, n_off = len(c["on"]), len(c["off"])
-            if n_on >= CROWD_MIN and n_on >= 2 * n_off:
+            # офіційно ще відключення (аварія «до …» / слот графіка) — вмикають поступово: «дали» від 3 людей
+            # ще не новина; пушимо «почали вмикати» лише від ON_PARTIAL_MIN людей
+            o_alert, o_slot, _, o_until = await status.official_outage(grp, prov, sch)
+            official = bool(o_alert or o_slot)
+            min_on = max(CROWD_MIN, status.ON_PARTIAL_MIN) if official else CROWD_MIN
+            if n_on >= min_on and n_on >= 2 * n_off:
                 new = "on"
             elif n_off >= min_off and n_off >= 2 * n_on:
                 new = "off"
@@ -197,8 +203,10 @@ async def crowd_check(bot: Bot):
             await db.kv_set(f"{skey}_ts:{grp}", str(int(time.time())))
 
             if new == "on":
-                what = "почали вмикати світло" if n_off else "дали світло"
+                what = "почали вмикати світло" if (n_off or official) else "дали світло"
                 head, n = f"💡 <b>Люди пишуть: {name} {grp} — {what}</b>", n_on
+                if official:
+                    head += "\n🟡 Поки не всім" + (f" — офіційно відключення до <b>{o_until}</b>" if o_until else "")
             elif emergency:
                 head, n = f"🚨 <b>{name} {grp}: вимкнули світло — екстрене відключення</b>", n_off
             else:
