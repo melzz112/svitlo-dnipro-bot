@@ -208,12 +208,23 @@ async def latest_alert(grp, hours=6, provider="dtek"):
 
 
 # --- резервні графіки з постів у Telegram-каналах ---
-async def save_channel_schedule(provider: str, day: str, groups: dict, updated: str):
-    """day 'YYYY-MM-DD'; groups {"1.1": [[9.5, 13.0], ...]}. Злиття: коригування може мати не всі групи."""
+async def save_channel_schedule(provider: str, day: str, groups: dict, updated: str, post_ts: float | None = None):
+    """day 'YYYY-MM-DD'; groups {"1.1": [[9.5, 13.0], ...]}. Злиття: коригування може мати не всі групи.
+    post_ts — час поста: групу оновлюємо лише новішим постом (вчорашній «графік на завтра» з іншого
+    каналу не затре сьогоднішнє «Оновлений графік»)."""
+    post_ts = time.time() if post_ts is None else post_ts
     cur = json.loads(await kv_get(f"gpv:{provider}:{day}") or "{}")
-    cur.update({g: [list(x) for x in v] for g, v in groups.items()})
+    stamps = json.loads(await kv_get(f"gpvts:{provider}:{day}") or "{}")
+    fresh = {g: v for g, v in groups.items() if post_ts >= stamps.get(g, 0)}
+    if not fresh:
+        return False
+    cur.update({g: [list(x) for x in v] for g, v in fresh.items()})
+    stamps.update({g: post_ts for g in fresh})
     await kv_set(f"gpv:{provider}:{day}", json.dumps(cur))
-    await kv_set(f"gpvupd:{provider}:{day}", updated)
+    await kv_set(f"gpvts:{provider}:{day}", json.dumps(stamps))
+    if post_ts >= max(stamps.values()):
+        await kv_set(f"gpvupd:{provider}:{day}", updated)
+    return True
 
 
 async def get_channel_schedule(provider: str, day: str) -> tuple[dict, str | None]:

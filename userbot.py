@@ -67,22 +67,24 @@ async def save_schedules(raw: str, when: datetime) -> int:
     """Графіки ДТЕК/ЦЕК з поста -> БД. when — час поста (для постів без дати = «сьогодні» на момент поста)."""
     n = 0
     for prov, day, groups in parse_schedule_posts(raw, when.date()):
-        await db.save_channel_schedule(prov, day.isoformat(), groups, when.strftime("%H:%M %d.%m"))
-        log.info("schedule %s %s: %d груп", prov, day, len(groups))
-        n += 1
+        if await db.save_channel_schedule(prov, day.isoformat(), groups, when.strftime("%H:%M %d.%m"), when.timestamp()):
+            log.info("schedule %s %s: %d груп", prov, day, len(groups))
+            n += 1
     return n
 
 
 async def backfill(client, channels, limit=40):
-    """При старті: дочитуємо останні пости, щоб графік на сьогодні/завтра був одразу (лише графіки, без пушів)."""
+    """При старті: дочитуємо останні пости, щоб графік на сьогодні/завтра був одразу (лише графіки, без пушів).
+    Пости ВСІХ каналів сортуємо разом за часом — інакше вчорашній пост з другого каналу
+    затирав би сьогоднішнє коригування з першого."""
+    msgs = []
     for ch in channels:
         try:
-            msgs = [m async for m in client.iter_messages(ch, limit=limit) if m.raw_text]
+            msgs += [m async for m in client.iter_messages(ch, limit=limit) if m.raw_text]
         except Exception as e:
             log.warning("backfill %s failed: %r", getattr(ch, "username", ch), e)
-            continue
-        for m in reversed(msgs):  # від старих до нових — новіші коригування перекривають
-            await save_schedules(m.raw_text, m.date.astimezone(TZ))
+    for m in sorted(msgs, key=lambda m: m.date):
+        await save_schedules(m.raw_text, m.date.astimezone(TZ))
 
 
 async def _handle_post(raw: str):

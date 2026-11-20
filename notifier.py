@@ -24,6 +24,9 @@ def _slots_str(slots) -> str:
     return ", ".join(parts) or "без відключень"
 
 
+SITE_SOURCES = ("dtek", "yasno")  # «офіційніші» за Telegram-канали
+
+
 def _pkey(provider: str, name: str) -> str:
     """Ключі kv: у ДТЕК — старі (без префікса), щоб після деплою не було хибних «оновився»."""
     return name if provider == "dtek" else f"{provider}_{name}"
@@ -63,10 +66,18 @@ async def tick(bot: Bot):
             schedule = days[day]
             for grp, slots in schedule.groups.items():
                 key, new = f"{_pkey(prov, 'sched')}:{d}:{grp}", _slots_str(slots)
+                src_key = f"{_pkey(prov, 'schedsrc')}:{d}:{grp}"
                 old = await db.kv_get(key)
                 if old == new:
                     continue
+                old_src = await db.kv_get(src_key)
+                if schedule.source == "channel" and old_src in SITE_SOURCES:
+                    # сайт тимчасово недоступний, а в каналах інша (часто старіша) версія — не смикаємо людей
+                    # і не перезаписуємо: коли сайт повернеться з тим самим графіком, пуша теж не буде
+                    log.info("skip %s %s %s: site->channel fallback (%s vs %s)", prov, d, grp, old, new)
+                    continue
                 await db.kv_set(key, new)
+                await db.kv_set(src_key, schedule.source)
                 if not initialized:
                     continue
                 title = "Сьогодні" if day == "today" else "Завтра"

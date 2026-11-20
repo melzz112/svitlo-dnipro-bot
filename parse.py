@@ -117,6 +117,7 @@ def _post_date(t: str, today):
 
 
 PROVIDER_RE = re.compile(r"цек|дтек|дтэк")
+NO_OUTAGE_RE = re.compile(r"не прогнозу\w*|не плану\w*|відключень немає|без відключень|відключення відсутні")
 
 
 def parse_schedule_posts(raw: str, today) -> list[tuple]:
@@ -154,9 +155,10 @@ def parse_schedule_posts(raw: str, today) -> list[tuple]:
                 h1, m1, h2, m2 = map(int, val)
                 groups[cur].append((h1 + m1 / 60, h2 + m2 / 60))
         n_intervals = sum(len(v) for v in groups.values())
+        no_outages = len(NO_OUTAGE_RE.findall(seg))  # «Група 1.1 / Відключення не прогнозується»
         if not re.search(r"графік|график", seg):
             groups = {g: v for g, v in groups.items() if v}  # «зміни для» — лише групи з інтервалами
-        if len(groups) < 3 or n_intervals == 0:  # не графік, а попередження/зведення
+        if len(groups) < 3 or (n_intervals == 0 and no_outages < 3):  # не графік, а попередження/зведення
             continue
         out.append((prov, _post_date(seg, today), groups))
     return out

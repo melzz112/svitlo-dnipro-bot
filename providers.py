@@ -177,8 +177,20 @@ def demo_schedule() -> Schedule:
 
 SITE_CACHE_SEC = 60
 SITE_RETRY_SEC = {"dtek": 30 * 60, "yasno": 60}
+# Якщо сайт на хвилину не відповів — тримаємо його останню відповідь, а не стрибаємо на графік з каналів:
+# він може відрізнятись, і бот розсилав би «оновився» туди-сюди.
+SITE_STALE_SEC = 3 * 3600
 _site_cache: dict[tuple[str, str], tuple[date, float, dict[str, DaySchedule] | None]] = {}
+_site_last_good: dict[tuple[str, str], tuple[date, float, dict[str, DaySchedule]]] = {}
 _site_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+
+def _stale(key, today: date) -> dict[str, DaySchedule] | None:
+    if good := _site_last_good.get(key):
+        day, at, snapshot = good
+        if day == today and time.monotonic() - at < SITE_STALE_SEC:
+            return snapshot
+    return None
 
 
 async def channel_schedule(provider: str, day: date) -> DaySchedule:
@@ -194,15 +206,16 @@ async def _site_schedule(source: str, provider: str, today: date) -> dict[str, D
         if cached := _site_cache.get(key):
             day, expires, snapshot = cached
             if time.monotonic() < expires and (snapshot is None or day == today):
-                return snapshot
+                return snapshot if snapshot is not None else _stale(key, today)
         try:
             async with asyncio.timeout(7):
                 snapshot = await (fetch_dtek(today) if source == "dtek" else fetch_yasno(today, provider))
         except (httpx.HTTPError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as exc:
             log.warning("%s schedule for %s unavailable: %r", source, provider, exc)
             _site_cache[key] = (today, time.monotonic() + SITE_RETRY_SEC[source], None)
-            return None
+            return _stale(key, today)
         _site_cache[key] = (today, time.monotonic() + SITE_CACHE_SEC, snapshot)
+        _site_last_good[key] = (today, time.monotonic(), snapshot)
         return snapshot
 
 
