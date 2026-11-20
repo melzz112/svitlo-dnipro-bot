@@ -85,42 +85,59 @@ async def verdict(grp: str, provider: str) -> str:
         off_ts = [ts for ts in off_ts if ts >= first_on]
     n_on, n_off = len(on_ts), len(off_ts)
 
-    # 1) підсумок: люди важать більше за графік/канали, коли їх хоча б двоє
+    # 1) підсумок (великий рядок) + пояснення: люди важать більше за графік/канали, коли їх хоча б двоє
+    today_slots = sch.get("today", {}).get(grp)
     if n_on >= 2 and n_off == 0:
-        head = "🟢 <b>Світло є</b> — люди пишуть, що дали"
+        head, sub = "🟢 <b>Світло є</b>", "люди пишуть, що дали"
     elif n_on >= 2 and n_on >= 3 * n_off:
-        head = "🟢 <b>Світло є у більшості</b> — але дехто ще пише, що немає"
+        head, sub = "🟢 <b>Світло є у більшості</b>", "дехто ще пише, що немає"
     elif n_on >= 2 and n_off >= 1 and n_on >= n_off:
-        head = "🟡 <b>Частково є світло</b> — багатьом дали, але не всім"
+        head, sub = "🟡 <b>Частково є світло</b>", "багатьом дали, але не всім"
     elif n_off >= 2 and n_on >= 1:
-        head = "🟡 <b>Здебільшого немає</b> — лише частині адрес дали"
+        head, sub = "🟡 <b>Здебільшого немає</b>", "лише частині адрес дали"
     elif n_off >= 2:
-        head = "🔴 <b>Світла немає</b> — люди підтверджують"
+        head, sub = "🔴 <b>Світла немає</b>", "люди підтверджують"
     elif n_on == 1 and n_off == 1:
-        head = "🟡 <b>Неоднозначно</b> — повідомлення розходяться"
+        head, sub = "🟡 <b>Неоднозначно</b>", "повідомлення розходяться"
     elif official_off:
-        head = "🔴 <b>Світла немає</b>"
-    elif sch.get("today", {}).get(grp) is None:
-        head = "❔ <b>Невідомо</b> — графіка немає, люди не пишуть"
+        head, sub = "🔴 <b>Світла немає</b>", "за графіком" if slot and not alert else "аварійне / екстрене"
+    elif today_slots is None:
+        head, sub = "❔ <b>Невідомо</b>", "графіка немає, люди не пишуть"
     else:
-        head = "🟢 <b>Світло має бути</b>"
+        head, sub = "🟢 <b>Світло має бути</b>", "за графіком зараз без відключень"
 
-    lines = [head]
-    people_say_on = n_on >= 2 and n_on >= n_off
-    # 2) причина / що офіційно
-    if alert:
-        until = f", орієнтовно до <b>{alert['until']}</b>" if alert["until"] else ""
-        prefix = "🚨 Офіційно ще" if people_say_on else "🚨 Причина:"
-        lines.append(f"{prefix} {_label(alert['text'])}{until}")
-    elif slot:
-        prefix = "📅 За графіком ще" if people_say_on else "📅 Причина:"
-        lines.append(f"{prefix} відключення до <b>{hm(slot.end)}</b>")
-    elif n_off >= 2:
-        lines.append("❓ Ні в графіку, ні в каналах відключення немає — можливо, локальна аварія")
-    # 3) люди
+    lines = [head, f"<i>{sub}</i>", ""]
+    # 2) факти: люди / офіційно / графік
     if n_on or n_off:
-        period = "з початку відключення" if starts else "за 3 год"
-        lines.append(f"👥 Люди {period}: 💡 «є» — {n_on}, 🕯 «нема» — {n_off}")
-        if on_ts and people_say_on:
-            lines.append(f"🕐 Останнє «дали» — {_ago(max(on_ts))}")
-    return "\n".join(lines)
+        lines.append(f"👥 Люди пишуть:  💡 є — {n_on}  ·  🕯 нема — {n_off}")
+    if alert:
+        until = f" до <b>{_short_until(alert['until'], now)}</b>" if alert["until"] else ""
+        lines.append(f"🚨 Офіційно: {_label(alert['text'])}{until}")
+    elif n_off >= 2 and not slot:
+        lines.append("❓ Ні в графіку, ні в каналах відключення немає — можливо, локальна аварія")
+    if sched_line := _schedule_line(today_slots, slot, t):
+        lines.append(sched_line)
+    return "\n".join(lines).rstrip()
+
+
+def _short_until(until: str, now: datetime) -> str:
+    """«10:18 20.11» -> «10:18» сьогодні, «02:06 (завтра)» — наступного дня."""
+    hm_, _, dm = until.partition(" ")
+    if not dm or dm == now.strftime("%d.%m"):
+        return hm_
+    if dm == (now + timedelta(days=1)).strftime("%d.%m"):
+        return f"{hm_} (завтра)"
+    return until
+
+
+def _schedule_line(slots, current, t: float) -> str | None:
+    if slots is None:
+        return None
+    if current:
+        return f"📅 Графік: відключення до <b>{hm(current.end)}</b>"
+    nxt = min((s for s in slots if s.kind == "off" and s.start > t), key=lambda s: s.start, default=None)
+    if not nxt:
+        return "📅 Графік: сьогодні більше відключень немає"
+    left = nxt.start - t
+    wait = f"{int(left)} год {round(left % 1 * 60)} хв" if left >= 1 else f"{round(left * 60)} хв"
+    return f"📅 Графік: далі <b>{hm(nxt.start)}–{hm(nxt.end)}</b> (через {wait})"

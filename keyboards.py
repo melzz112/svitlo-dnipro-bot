@@ -62,6 +62,15 @@ def sched_kb(day: str):
     return b.as_markup()
 
 
+def now_kb():
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Оновити", callback_data=Nav(to="now"))
+    b.button(text="📅 Графік", callback_data=Nav(to="sched", arg="today"))
+    _back(b)
+    b.adjust(2, 1)
+    return b.as_markup()
+
+
 def simple_kb(refresh_to: str):
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Оновити", callback_data=Nav(to=refresh_to))

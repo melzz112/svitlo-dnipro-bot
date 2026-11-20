@@ -1,4 +1,5 @@
 import time
+from datetime import datetime
 from html import escape
 
 from aiogram import F, Router
@@ -8,8 +9,9 @@ from aiogram.types import CallbackQuery, Message
 
 import db
 import keyboards as kb
-from providers import get_schedule, get_schedule_days
-from render import day_text, now_status
+from providers import get_schedule_days
+from config import TZ
+from render import day_text
 from status import verdict
 
 router = Router()
@@ -122,15 +124,9 @@ def _ago(ts: int) -> str:
 async def now(cb: CallbackQuery):
     if not (u := await _need_group(cb)):
         return
-    p = _prov(u)
-    s = await get_schedule(provider=p)
-    text = f"⚡ <b>Зараз</b> · {_pname(u)} · група <b>{u['grp']}</b>\n\n{await verdict(u['grp'], p)}"
-    status = now_status(s.get("today", {}).get(u["grp"]))
-    if "немає" not in status:  # наступне відключення за графіком (якщо зараз не відключення)
-        text += f"\n📅 {status}"
-    if a := await db.latest_alert(u["grp"], provider=p):
-        text += f"\n\n📣 <i>Останнє з каналів ({_ago(a['ts'])}):</i>\n{a['text']}"
-    await edit(cb, text, kb.simple_kb("now"))
+    clock = datetime.now(TZ).strftime("%H:%M")
+    text = f"⚡ <b>{_pname(u)} · група {u['grp']}</b>  ·  {clock}\n\n{await verdict(u['grp'], _prov(u))}"
+    await edit(cb, text, kb.now_kb())
 
 
 @router.callback_query(kb.Nav.filter(F.to == "chats"))
