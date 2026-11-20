@@ -17,3 +17,8 @@
 
 Файли: `providers.py` (графіки), `dtek_site.py` (екстрені по групах з сайту ДТЕК), `parse.py` (розбір чатів + цензура),
 `handlers.py`/`keyboards.py` (меню), `notifier.py` (пуші), `db.py` (SQLite).
+
+**Автооновлення на сервері.** Один раз із папки бота:
+`(crontab -l 2>/dev/null; echo "*/2 * * * * $(pwd)/deploy/autoupdate.sh >> $(pwd)/autoupdate.log 2>&1") | crontab -`
+Далі раз на 2 хв сервер перевіряє гілку на GitHub і, якщо є нові коміти, сам робить `git pull` і перезбирає бота.
+Лог — `autoupdate.log`.
