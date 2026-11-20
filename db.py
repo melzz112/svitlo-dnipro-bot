@@ -152,9 +152,14 @@ async def chat_stats(minutes=30, provider="dtek"):
     return out
 
 
-async def recent_chat_msgs(hours=2, limit=12):
+async def recent_chat_msgs(grp, provider="dtek", hours=2, limit=10):
+    """Лише повідомлення, де згадано саме цю групу, і лише свого постачальника."""
     since = int(time.time()) - hours * 3600
-    return await _all("SELECT * FROM chat_msgs WHERE ts>=? ORDER BY ts DESC LIMIT ?", (since, limit))
+    return await _all(
+        f"SELECT * FROM chat_msgs WHERE ts>=? AND (','||grp||',') LIKE ? AND {_chat_provider_sql(provider)} "
+        "ORDER BY ts DESC LIMIT ?",
+        (since, f"%,{grp},%", limit),
+    )
 
 
 # --- alerts з каналів ---

@@ -230,8 +230,9 @@ def _parse_channel(raw: str) -> list[Alert]:
         return []
 
     # ✅ ДТЕК: активне відключення не підтверджується / Група: 1.2
-    if "не підтверджується" in t:
-        return [_on(g, "активне відключення не підтверджується") for g in find_groups(t)]
+    if "не підтверджується" in t:  # ДТЕК перевіряє лише контрольні адреси — це часто «частково»
+        label = "за контрольними адресами ДТЕК відключення не підтверджується\nℹ️ Частині адрес могли дати світло, а частині — ще ні"
+        return [_on(g, label) for g in find_groups(t)]
 
     # 🚨 ДТЕК: аварійне / екстрене відключення світла / Група: 5.1 / ⏱️ з … — до 22:25 19.11.2026
     if re.search(r"аварійне\s*/\s*екстрене", t):
@@ -297,6 +298,12 @@ QUESTION = re.compile(
 SIGN_OFF = re.compile(r"(?:^|\s)[-−–]\s*(?:свет|світло|св)(?!\w)|^\s*[-−–]{1,3}\s*$")
 SIGN_ON = re.compile(r"(?:^|\s)\+\s*(?:свет|світло|св)(?!\w)|^\s*\+{1,3}\s*$")
 NEGATED_ON = re.compile(r"(?<!\w)(не|ще не|еще не|досі не|так и не|так і не)\s+(дали|включили|увімкнули|ввімкнули|з'явил\w*)")
+# «не выключили», «не відключали» — світло є, але це не звіт «дали»; краще пропустити
+NEGATED_OFF = re.compile(r"(?<!\w)не\s+(вы|ви)?(ключили|ключали)(?!\w)|(?<!\w)не\s+(відключ|отключ|вимкн|вируб|выруб)\w*")
+# побажання/страхи: «хоть бы не отключили», «аби не вимкнули», «надеюсь дадут»
+WISH = re.compile(
+    r"(?<!\w)(хоть бы|хотя бы|лишь бы|только бы|аби не|аби|щоб не|чтоб не|чтобы не|якби|если бы|надеюсь|сподіваюсь|сподіваюся|мабуть|наверное|может|хочу|хочется|хочеться)(?!\w)"
+)
 
 
 def _has(t: str, phrases: list[str]) -> bool:
@@ -306,7 +313,9 @@ def _has(t: str, phrases: list[str]) -> bool:
 def parse_user(raw: str) -> dict | None:
     """«1.1 нема світла» -> {"event": "off", "groups": ["1.1"], "district": None}."""
     t = norm(raw).lower().strip()
-    if not t or len(t) > 200 or CENSOR.search(t) or OFF_TOPIC.search(t) or QUESTION.search(t):
+    if not t or len(t) > 200 or CENSOR.search(t) or OFF_TOPIC.search(t) or QUESTION.search(t) or WISH.search(t):
+        return None
+    if NEGATED_OFF.search(t) and not _has(t, ON_PHRASES):  # «его со вчера не выключили»
         return None
     groups = find_groups(t, user=True)
     rest = QUEUE_RE.sub(" ", USER_GROUP_RE.sub(" ", t)).strip()  # без номерів, щоб «1.1 -» дало «-»

@@ -11,6 +11,7 @@ import keyboards as kb
 import providers
 from providers import get_schedule
 from render import day_text, now_status
+from status import verdict
 
 router = Router()
 
@@ -122,38 +123,33 @@ async def now(cb: CallbackQuery):
         return
     p = _prov(u)
     s = await get_schedule(provider=p)
-    chat = (await db.chat_stats(provider=p)).get(u["grp"])
-    text = (
-        f"⚡ <b>Зараз</b> · {_pname(u)} · група <b>{u['grp']}</b>\n\n"
-        f"📅 {now_status(s.get('today', {}).get(u['grp']))}\n"
-        f"{_crowd_line(await db.report_stats(u['grp'], provider=p), chat)}"
-    )
+    text = f"⚡ <b>Зараз</b> · {_pname(u)} · група <b>{u['grp']}</b>\n\n{await verdict(u['grp'], p)}"
+    status = now_status(s.get("today", {}).get(u["grp"]))
+    if "немає" not in status:  # наступне відключення за графіком (якщо зараз не відключення)
+        text += f"\n📅 {status}"
     if a := await db.latest_alert(u["grp"], provider=p):
-        text += f"\n\n📣 <b>З каналів</b> ({_ago(a['ts'])}):\n{a['text']}"
+        text += f"\n\n📣 <i>Останнє з каналів ({_ago(a['ts'])}):</i>\n{a['text']}"
     await edit(cb, text, kb.simple_kb("now"))
 
 
 @router.callback_query(kb.Nav.filter(F.to == "chats"))
 async def chats(cb: CallbackQuery):
-    u = await db.get_user(cb.from_user.id)
-    stats = await db.chat_stats(provider=_prov(u))
-    head = "💬 <b>Що пишуть люди</b> <i>(не перевірено)</i>\n\n"
-    if stats:
-        head += f"За 30 хв по групах ({_pname(u)}):\n" + "\n".join(
-            f"{'👉 ' if g == u['grp'] else ''}<b>{g}</b>: 🕯 {c.get('off', 0)}  💡 {c.get('on', 0)}"
-            for g, c in sorted(stats.items())
-        ) + "\n\n"
-    msgs = await db.recent_chat_msgs()
+    if not (u := await _need_group(cb)):
+        return
+    p, g = _prov(u), u["grp"]
+    head = f"💬 <b>Що пишуть про {_pname(u)} {g}</b> <i>(не перевірено)</i>\n\n"
+    c = (await db.chat_stats(provider=p)).get(g)
+    if c:
+        head += f"За 30 хв: 💡 «є» — {c.get('on', 0)}, 🕯 «нема» — {c.get('off', 0)}\n\n"
+    msgs = await db.recent_chat_msgs(g, p)
     if not msgs:
-        text = head + "За останні 2 год повідомлень немає."
+        text = head + f"За останні 2 год про групу {g} ніхто не писав «дали» чи «вимкнули»."
     else:
         lines = []
         for r in msgs:
-            street = f"вул. {r['street']}" if r.get("street") else ""
-            prov = "ЦЕК" if r.get("provider") == "cek" else ""
-            tags = " · ".join(x for x in (prov, r.get("grp") or "", r["district"] or "", street) if x)
+            place = " · ".join(x for x in (r["district"] or "", f"вул. {r['street']}" if r.get("street") else "") if x)
             lines.append(
-                f"{ICON.get(r['event'], '❔')} {f'<b>{escape(tags)}</b> · ' if tags else ''}{_ago(r['ts'])}\n"
+                f"{ICON.get(r['event'], '❔')} {_ago(r['ts'])}{f' · <b>{escape(place)}</b>' if place else ''}\n"
                 f"<i>{escape(r['text'][:120])}</i>"
             )
         text = head + "\n".join(lines)

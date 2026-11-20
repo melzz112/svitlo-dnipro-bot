@@ -98,6 +98,18 @@ async def tick(bot: Bot):
                     )
 
 
+ON_HOLD_SEC = 5 * 60  # «світло дали» з каналів чекає 5 хв, щоб звірити з чатами
+
+
+async def _contradicted_by_chats(a: dict) -> bool:
+    """Канал каже «не підтверджується / відновлення», а люди в чатах пишуть «нема» -> не шлемо."""
+    c = (await db.crowd(30, a.get("provider") or "dtek")).get(a["grp"])
+    if not c:
+        return False
+    n_on, n_off = len(c["on"]), len(c["off"])
+    return n_off >= 2 and n_off >= n_on
+
+
 async def send_alerts(bot: Bot):
     """Події з каналів (юзербот кладе в alerts) -> людям потрібної групи і постачальника, загальні — всім."""
     alerts = await db.pending_alerts()
@@ -105,6 +117,13 @@ async def send_alerts(bot: Bot):
         return
     users = [u for u in await db.users_with_group() if u["notify_on"]]
     for a in alerts:
+        if a["kind"] == "on":
+            if time.time() - a["ts"] < ON_HOLD_SEC:
+                continue  # ще чекаємо, що скажуть люди
+            if await _contradicted_by_chats(a):
+                await db.mark_alert_sent(a["key"])
+                log.info("alert %s dropped: chats say no power", a["key"])
+                continue
         await db.mark_alert_sent(a["key"])
         for u in users:
             if _matches(a.get("provider") or "dtek", u) and (a["grp"] == "*" or a["grp"] == u["grp"]):
