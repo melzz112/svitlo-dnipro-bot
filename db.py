@@ -127,13 +127,19 @@ async def crowd(minutes=15, provider="dtek"):
     def slot(g):
         return out.setdefault(g, {"on": set(), "off": set(), "places": Counter()})
 
-    for r in await _all(f"SELECT * FROM chat_msgs WHERE ts>=? AND grp!='' AND {_chat_provider_sql(provider)}", (since,)):
+    latest: dict[tuple, str] = {}  # (група, людина) -> її ОСТАННІЙ стан: «дали», потім «знову нема» = нема
+    rows = await _all(
+        f"SELECT * FROM chat_msgs WHERE ts>=? AND grp!='' AND {_chat_provider_sql(provider)} ORDER BY ts", (since,)
+    )
+    for r in rows:
+        who = r["who"] or f"m{r['ts']}{r['text'][:20]}"
         for g in r["grp"].split(","):
-            s = slot(g)
-            s[r["event"]].add(r["who"] or f"m{r['ts']}{r['text'][:20]}")
+            latest[(g, who)] = r["event"]
             for p in (r["district"], r["street"]):
                 if p and r["event"] == "on":
-                    s["places"][p] += 1
+                    slot(g)["places"][p] += 1
+    for (g, who), ev in latest.items():
+        slot(g)[ev].add(who)
     for r in await _all("SELECT * FROM reports WHERE ts>=? AND provider=?", (since, provider)):
         slot(r["grp"])[r["status"]].add(f"bot{r['user_id']}")
     return out

@@ -36,7 +36,34 @@ def alert_key(a, raw: str) -> str:
     return f"{a.provider}:{a.kind}:{a.grp}:{day}:{bucket}"
 
 
+MIN_SHIFT_MIN = 30  # «продовжено до 10:16» після «до 10:03» — не новина; пушимо зсув від 30 хв
+_post_lock = asyncio.Lock()  # два канали постять одне й те саме в ту ж секунду -> без дублів
+
+
+def until_shift(new: str, old: str) -> int:
+    """Різниця в хвилинах між «HH:MM [DD.MM]». Якщо в одного немає дати — порівнюємо лише час."""
+    def parse(u):
+        hm, _, dm = u.partition(" ")
+        h, m = map(int, hm.split(":"))
+        d, _, mo = dm.partition(".")
+        return h * 60 + m, (int(mo), int(d)) if dm else None
+
+    (tn, dn), (to, do) = parse(new), parse(old)
+    if dn and do:
+        from datetime import date
+
+        days = (date(2000, *dn) - date(2000, *do)).days
+        return days * 1440 + tn - to
+    d = (tn - to) % 1440
+    return d - 1440 if d > 720 else d
+
+
 async def handle_post(raw: str):
+    async with _post_lock:
+        await _handle_post(raw)
+
+
+async def _handle_post(raw: str):
     """Пост каналу -> графік ЦЕК у БД і/або alerts з антиспамом."""
     now = datetime.now(TZ)
     if cek := parse_cek_schedule(raw, now.date()):
@@ -50,8 +77,12 @@ async def handle_post(raw: str):
                 continue
         elif a.kind == "off" and a.until:
             prev = await db.last_alert("off", a.grp, 12 * 60, a.provider)
-            if prev and prev["until"] and ukey(a.until) > ukey(prev["until"]):
-                a.text = a.text.replace("Аварійне/екстрене відключення", "Відключення продовжено")
+            if prev and prev["until"]:
+                shift = until_shift(a.until, prev["until"])
+                if abs(shift) < MIN_SHIFT_MIN:
+                    continue  # дрібне уточнення часу — не смикаємо людей
+                old_label = "Аварійне/екстрене відключення"
+                a.text = a.text.replace(old_label, "Відключення продовжено" if shift > 0 else "Відключення скорочено")
         if await db.add_alert(alert_key(a, raw), a.kind, a.grp, a.until, a.text, a.provider):
             log.info("ALERT %s %s %s %s", a.provider, a.kind, a.grp, a.until)
 
@@ -122,7 +153,15 @@ async def main():
         msg = event.message
         if msg.fwd_from or not isinstance(msg.from_id, PeerUser):  # копії постів каналу, адміни від імені каналу
             return
-        res = parse_user(event.raw_text or "")
+        reply_raw = None
+        if msg.reply_to and getattr(msg.reply_to, "reply_to_msg_id", None):
+            try:  # «+» / «у меня тоже» / «а нам не дали» — сенс і група з повідомлення, на яке відповіли
+                parent = await event.get_reply_message()
+                if parent and isinstance(parent.from_id, PeerUser) and not parent.fwd_from:
+                    reply_raw = parent.raw_text
+            except Exception as e:
+                log.debug("reply fetch failed: %r", e)
+        res = parse_user(event.raw_text or "", reply_raw)
         if not res:
             return
         chat = getattr(event.chat, "title", "") or ""
