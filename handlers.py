@@ -2,17 +2,27 @@ import time
 from datetime import datetime
 from html import escape
 
+import json
+import logging
+
+import httpx
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, Message
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 
 import db
+import dtek_site
 import keyboards as kb
+from address import norm_house, parse_text_address, reverse_geocode
 from providers import get_schedule_days
 from config import TZ
 from render import day_text
-from status import emergency_today, verdict
+from status import emergency_today, house_block, verdict
+
+log = logging.getLogger(__name__)
 
 router = Router()
 
@@ -49,7 +59,8 @@ async def edit(cb: CallbackQuery, text: str, markup):
 
 @router.message(CommandStart())
 @router.message(Command("menu"))
-async def start(m: Message):
+async def start(m: Message, state: FSMContext):
+    await state.clear()
     u = await db.get_user(m.from_user.id)
     if not u["grp"]:
         await m.answer(PICK_TEXT.format(prov=_pname(u)), reply_markup=kb.groups_kb(None, _prov(u)))
@@ -71,7 +82,8 @@ async def set_group(cb: CallbackQuery, callback_data: kb.SetGroup):
 
 
 @router.callback_query(kb.Nav.filter(F.to == "menu"))
-async def menu(cb: CallbackQuery):
+async def menu(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
     await edit(cb, _menu_text(await db.get_user(cb.from_user.id)), kb.main_menu())
 
 
@@ -131,7 +143,10 @@ async def now(cb: CallbackQuery):
     if not (u := await _need_group(cb)):
         return
     clock = datetime.now(TZ).strftime("%H:%M")
-    text = f"⚡ <b>{_pname(u)} · група {u['grp']}</b>  ·  {clock}\n\n{await verdict(u['grp'], _prov(u))}"
+    text = f"⚡ <b>{_pname(u)} · група {u['grp']}</b>  ·  {clock}\n\n"
+    if house := await house_block(u):  # найточніше — що сайт ДТЕК каже саме про твій будинок
+        text += f"{house}\n\n<b>По групі:</b>\n"
+    text += await verdict(u["grp"], _prov(u))
     await edit(cb, text, kb.now_kb())
 
 
@@ -195,3 +210,146 @@ async def notify(cb: CallbackQuery, callback_data: kb.Notify):
     else:
         await db.set_user(cb.from_user.id, notify_min=callback_data.value, notify_on=1)
     await edit(cb, SETTINGS_TEXT, kb.settings_kb(await db.get_user(cb.from_user.id)))
+
+
+# ---------- адреса: геопозиція або текст -> будинок на сайті ДТЕК -> група і точні пуші ----------
+
+
+class Addr(StatesGroup):
+    waiting = State()  # чекаємо геопозицію або адресу текстом
+    house = State()  # вулицю знаємо, чекаємо номер будинку
+
+
+ADDR_TEXT = (
+    "📍 <b>Твоя адреса</b>\n"
+    "Я знайду твій будинок на сайті ДТЕК, сам визначу групу і стежитиму саме за ним: "
+    "щойно там аварія чи екстрене — пуш, до котрої години, і коли світло повернеться.\n\n"
+    "Натисни <b>«📍 Надіслати геопозицію»</b> (з телефону, коли ти вдома) або напиши адресу, "
+    "напр. <i>Яворницького 3</i> чи <i>вул. Шевченка, 10А</i>.\n\n"
+    "🔒 Координати використовуються лише щоб знайти адресу (OpenStreetMap) і не зберігаються. "
+    "Я зберігаю тільки вулицю й номер будинку — видалити можна в налаштуваннях."
+)
+
+
+@router.callback_query(kb.Nav.filter(F.to == "addr"))
+async def addr_start(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(Addr.waiting)
+    await cb.message.answer(ADDR_TEXT, reply_markup=kb.location_kb())
+    await cb.answer()
+
+
+@router.callback_query(kb.Nav.filter(F.to == "addr_del"))
+async def addr_delete(cb: CallbackQuery):
+    await db.set_user(cb.from_user.id, street="", house="")
+    await db.kv_set(f"house:{cb.from_user.id}", "")
+    await db.kv_set(f"house_seen:{cb.from_user.id}", "")
+    await edit(cb, SETTINGS_TEXT + "\n\n🗑 Адресу видалено.", kb.settings_kb(await db.get_user(cb.from_user.id)))
+
+
+@router.message(Addr.waiting, F.text == kb.CANCEL_BTN)
+@router.message(Addr.house, F.text == kb.CANCEL_BTN)
+async def addr_cancel(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("Скасовано.", reply_markup=ReplyKeyboardRemove())
+    await m.answer(_menu_text(await db.get_user(m.from_user.id)), reply_markup=kb.main_menu())
+
+
+@router.message(Addr.waiting, F.location)
+async def addr_location(m: Message, state: FSMContext):
+    try:
+        road, house, city = await reverse_geocode(m.location.latitude, m.location.longitude)
+    except (httpx.HTTPError, ValueError) as e:
+        log.warning("reverse geocode failed: %r", e)
+        await m.answer("Не вдалось визначити адресу за геопозицією 😕 Напиши її текстом, напр. <i>Яворницького 3</i>.")
+        return
+    if city and "дніпр" not in city.lower():
+        await m.answer(f"Схоже, це не Дніпро ({city}) — бот поки лише для Дніпра. Напиши адресу текстом.")
+        return
+    if not road:
+        await m.answer("Не бачу вулиці в цій точці. Напиши адресу текстом, напр. <i>Яворницького 3</i>.")
+        return
+    if not house:
+        await state.update_data(street=road)
+        await state.set_state(Addr.house)
+        await m.answer(f"Вулиця: <b>{escape(road)}</b>.\nНапиши номер будинку (напр. <i>14А</i>).")
+        return
+    await _addr_resolve(m, state, road, house)
+
+
+@router.message(Addr.waiting, F.text)
+async def addr_text(m: Message, state: FSMContext):
+    street, house = parse_text_address(m.text)
+    if not street:
+        await m.answer("Напиши вулицю і номер будинку, напр. <i>Яворницького 3</i>.")
+        return
+    if not house:
+        await state.update_data(street=street)
+        await state.set_state(Addr.house)
+        await m.answer(f"Вулиця: <b>{escape(street)}</b>.\nНапиши номер будинку (напр. <i>14А</i>).")
+        return
+    await _addr_resolve(m, state, street, house)
+
+
+@router.message(Addr.house, F.text)
+async def addr_house(m: Message, state: FSMContext):
+    house = norm_house(m.text)
+    if not house or not house[0].isdigit():
+        await m.answer("Номер будинку — це цифри (і літера, якщо є), напр. <i>14А</i> чи <i>5/2</i>.")
+        return
+    await _addr_resolve(m, state, (await state.get_data()).get("street", ""), house)
+
+
+async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str):
+    await m.answer("🔎 Шукаю будинок на сайті ДТЕК…")
+    try:
+        res = await dtek_site.lookup(street_q, house)
+    except (httpx.HTTPError, ValueError) as e:
+        log.warning("ДТЕК lookup %r %r failed: %r", street_q, house, e)
+        await state.clear()
+        await m.answer("Сайт ДТЕК зараз не відповідає 😕 Спробуй за кілька хвилин (⚙️ Налаштування → 📍) "
+                       "або обери групу вручну.", reply_markup=ReplyKeyboardRemove())
+        u = await db.get_user(m.from_user.id)
+        await m.answer(PICK_TEXT.format(prov=_pname(u)), reply_markup=kb.groups_kb(u["grp"], _prov(u)))
+        return
+    if not res.street:
+        await m.answer(f"Не знайшов вулицю «{escape(street_q)}» у переліку ДТЕК. Перевір назву й напиши ще раз "
+                       "(напр. <i>просп. Яворницького 3</i>). Якщо ти абонент ЦЕК — натисни «❌ Скасувати» "
+                       "і обери групу вручну.")
+        await state.set_state(Addr.waiting)
+        return
+    await state.clear()
+    if not res.house:
+        await m.answer(
+            f"Вулицю знайшов (<b>{escape(res.street)}</b>), але будинку <b>{escape(house)}</b> немає в даних ДТЕК.\n"
+            "Якщо номер правильний — схоже, твій будинок обслуговує <b>ЦЕК</b>. Обери постачальника й групу вручну "
+            "(вони є в рахунку за світло).", reply_markup=ReplyKeyboardRemove(),
+        )
+        u = await db.get_user(m.from_user.id)
+        await m.answer(PICK_TEXT.format(prov="ЦЕК"), reply_markup=kb.groups_kb(u["grp"], "cek"))
+        return
+    h = res.house
+    grp = h.groups[0] if h.groups else None
+    fields = {"street": res.street, "house": h.num, "provider": "dtek"}
+    if grp:
+        fields["grp"] = grp
+    await db.set_user(m.from_user.id, **fields)
+    # одразу запам'ятовуємо поточний стан, щоб перша ж перевірка не дублювала те, що людина бачить зараз
+    await db.kv_set(f"house_seen:{m.from_user.id}", json.dumps(
+        {"kind": h.kind, "reason": dtek_site.reason(h) if h.kind else "", "start": h.start, "end": h.end,
+         "ts": int(time.time()), "groups": h.groups, "street": res.street, "num": h.num}, ensure_ascii=False))
+    off = bool(h.kind) and h.kind != "schedule"
+    await db.kv_set(f"house:{m.from_user.id}", json.dumps({"start": h.start, "end": h.end, "miss": 0}) if off else "")
+    if off:
+        now_line = f"🔴 Зараз: {dtek_site.reason(h)}" + (f" до <b>{dtek_site.short_dt(h.end)}</b>" if h.end else "")
+    elif h.kind == "schedule":
+        now_line = "🔴 Зараз: відключення за графіком"
+    else:
+        now_line = "✅ Зараз відключень немає"
+    grp_line = f"🏢 ДТЕК · група <b>{grp}</b>" if grp else "🏢 ДТЕК · групу сайт не вказав — обери її вручну в ⚙️"
+    await m.answer(
+        f"✅ <b>Знайшов!</b>\n🏠 {escape(res.street)}, {escape(h.num)}\n{grp_line}\n{now_line}\n\n"
+        "Тепер я перевіряю твій будинок на сайті ДТЕК кожні кілька хвилин і напишу, щойно буде аварія, "
+        "продовження чи світло повернеться.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await m.answer(_menu_text(await db.get_user(m.from_user.id)), reply_markup=kb.main_menu())

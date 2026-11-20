@@ -5,6 +5,7 @@
 по одному — останньому — голосу від людини. «Продовжено до 10:18» від ДТЕК не перекреслює «дали»,
 які люди написали вже після початку відключення.
 """
+import json
 import re
 import time
 from datetime import datetime, timedelta
@@ -169,6 +170,8 @@ async def verdict(grp: str, provider: str) -> str:
         lines.append(f"🚨 Офіційно: {_label(alert['text'])}{until}")
         if alert.get("src") == "dteksite" and (m := re.search(r"🏠 ([^\n]*)", alert["text"])):
             lines.append(f"🏠 {m.group(1)} (сайт ДТЕК)")
+    elif provider == "dtek" and (share := await _group_share(grp, now)):
+        lines.append(share)  # екстрене лише в частини адрес групи — пуш усім не шлемо, але показуємо
     if city_em:
         lines.append("🚨 У Дніпрі діють екстрені відключення — графік зараз не діє")
     elif not alert and n_off >= 2 and not slot:
@@ -176,6 +179,39 @@ async def verdict(grp: str, provider: str) -> str:
     if not city_em and not is_emergency_alert(alert) and (sched_line := _schedule_line(today_slots, slot, t)):
         lines.append(sched_line)
     return "\n".join(lines).rstrip()
+
+
+FRESH_SEC = 15 * 60  # дані перевірки адрес на сайті ДТЕК вважаємо свіжими 15 хв
+
+
+async def _group_share(grp: str, now: datetime) -> str | None:
+    """«🏠 Сайт ДТЕК: екстрене у 30 з 265 перевірених адрес групи, до 18:05» (дані ≤15 хв)."""
+    s = json.loads(await db.kv_get(f"site_grp:{grp}") or "null")
+    if not s or not s.get("off") or now.timestamp() - s.get("ts", 0) > FRESH_SEC:
+        return None
+    end = re.match(r"(\d{1,2}:\d{2})(?:\s+(\d{2}\.\d{2}))?", s.get("end") or "")
+    until = f", до <b>{_short_until(' '.join(x for x in end.groups() if x), now)}</b>" if end else ""
+    return f"🏠 Сайт ДТЕК: екстрене у {s['off']} з {s['total']} перевірених адрес групи{until}"
+
+
+async def house_block(user: dict) -> str | None:
+    """Перший блок «Зараз» для того, хто вказав адресу: що сайт ДТЕК каже саме про його будинок."""
+    if not user.get("street") or not user.get("house") or (user.get("provider") or "dtek") != "dtek":
+        return None
+    seen = json.loads(await db.kv_get(f"house_seen:{user['id']}") or "null")
+    addr = f"{escape(user['street'])}, {escape(user['house'])}"
+    now = datetime.now(TZ)
+    if not seen or now.timestamp() - seen.get("ts", 0) > FRESH_SEC:
+        return f"🏠 <b>Твій будинок</b> ({addr}): сайт ДТЕК зараз не відповідає — дивись нижче за групою"
+    ago = int(now.timestamp() - seen["ts"]) // 60
+    checked = f"<i>сайт ДТЕК, {ago} хв тому</i>" if ago else "<i>сайт ДТЕК, щойно</i>"
+    if seen.get("kind") and seen["kind"] != "schedule":
+        end = re.match(r"(\d{1,2}:\d{2})(?:\s+(\d{2}\.\d{2}))?", seen.get("end") or "")
+        until = f" до <b>{_short_until(' '.join(x for x in end.groups() if x), now)}</b>" if end else ""
+        return f"🏠 <b>Твій будинок</b> ({addr})\n🔴 {seen.get('reason') or 'відключення'}{until} · {checked}"
+    if seen.get("kind") == "schedule":
+        return f"🏠 <b>Твій будинок</b> ({addr})\n🔴 відключення за графіком · {checked}"
+    return f"🏠 <b>Твій будинок</b> ({addr})\n✅ відключень немає · {checked}"
 
 
 def _short_until(until: str, now: datetime) -> str:

@@ -35,6 +35,8 @@ MIGRATIONS = [
     ("reports", "provider", "'dtek'"),
     ("alerts", "provider", "'dtek'"),  # 'dtek' | 'cek' | '*'
     ("alerts", "src", "'channel'"),  # 'channel' — канали-агрегатори, 'dteksite' — перевірка адрес на сайті ДТЕК
+    ("users", "street", "''"),  # адреса людини як на сайті ДТЕК («просп. Дмитра Яворницького») — для точних пушів
+    ("users", "house", "''"),  # номер будинку як на сайті («14А»). Координати не зберігаємо.
 ]
 
 PROVIDERS = ("dtek", "cek")
@@ -77,7 +79,7 @@ async def get_user(uid):
     if rows:
         return rows[0]
     await _exec("INSERT INTO users(id) VALUES(?)", (uid,))
-    return {"id": uid, "grp": None, "notify_on": 1, "notify_min": 15, "provider": "dtek"}
+    return {"id": uid, "grp": None, "notify_on": 1, "notify_min": 15, "provider": "dtek", "street": "", "house": ""}
 
 
 async def set_user(uid, **fields):
@@ -88,6 +90,11 @@ async def set_user(uid, **fields):
 
 async def users_with_group():
     return await _all("SELECT * FROM users WHERE grp IS NOT NULL")
+
+
+async def users_with_address():
+    """Абоненти ДТЕК, які вказали адресу, — за їх будинками стежимо на сайті ДТЕК."""
+    return await _all("SELECT * FROM users WHERE street!='' AND house!='' AND provider='dtek'")
 
 
 # --- звіти з кнопок бота ---

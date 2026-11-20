@@ -270,9 +270,10 @@ async def emergency_check(bot: Bot):
                 await asyncio.sleep(0.05)
 
 
-SITE_FAIL_SEC = 5 * 60  # сайт закрився антиботом — пробуємо знову за 5 хв
+SITE_FAIL_SEC = 15 * 60  # сайт закрився антиботом — пробуємо знову за 15 хв, не смикаємо його
 _site_next = 0.0
 _site_warned = 0.0
+MAX_USER_STREETS = 60  # скільки вулиць користувачів перевіряти за раз (решта — наступного разу)
 
 
 async def site_check(bot: Bot):
@@ -282,8 +283,15 @@ async def site_check(bot: Bot):
     if not DTEK_PROBE_SEC or SOURCE != "dtek" or CITY != "dnipro" or time.monotonic() < _site_next:
         return
     _site_next = time.monotonic() + DTEK_PROBE_SEC
+    # контрольні вулиці + вулиці людей, які вказали адресу (по одному запиту на вулицю, хоч скільки там людей)
+    addr_users = await db.users_with_address()
+    user_streets = list(dict.fromkeys(u["street"] for u in addr_users))
+    if len(user_streets) > MAX_USER_STREETS:  # по колу, щоб усі вулиці перевірялись
+        shift = int(time.time() // max(DTEK_PROBE_SEC, 1)) % len(user_streets)
+        user_streets = (user_streets[shift:] + user_streets[:shift])[:MAX_USER_STREETS]
+    streets = list(dict.fromkeys(user_streets + list(dtek_site.DTEK_STREETS)))
     try:
-        probe = await dtek_site.probe()
+        probe = await dtek_site.probe(streets)
     except (httpx.HTTPError, ValueError) as e:
         _site_next = time.monotonic() + SITE_FAIL_SEC
         log.warning("сайт ДТЕК: перевірка адрес не вдалась: %r", e)
@@ -291,6 +299,9 @@ async def site_check(bot: Bot):
     providers.set_notice("dtek", probe.attention)  # заодно свіже вікно «Шановні клієнти!»
     for change in await dtek_site.apply(probe):
         log.info("сайт ДТЕК: %s", change)
+    for uid, text in await dtek_site.apply_users(probe, addr_users):
+        await _send(bot, uid, text)
+        await asyncio.sleep(0.05)
     if time.monotonic() - _site_warned > 3600:
         _site_warned = time.monotonic()
         missing = [g for g, n in dtek_site.coverage(probe.houses).items() if not n]

@@ -47,6 +47,7 @@ class Probe:
     houses: list[House] = field(default_factory=list)
     attention: str | None = None  # вікно «Шановні клієнти!» з тієї ж сторінки
     failed: list[str] = field(default_factory=list)  # вулиці, по яких сайт нічого не дав
+    streets: list[str] = field(default_factory=list)  # перелік вулиць м. Дніпро з поля «Введіть вулицю»
 
 
 def classify(sub_type: str) -> str | None:
@@ -92,26 +93,76 @@ def _form(street: str, update: str | None) -> dict[str, str]:
     return data
 
 
+def parse_streets(html: str) -> list[str]:
+    """`DisconSchedule.streets = {...}` зі сторінки -> вулиці м. Дніпро. Формат не документований — розбираємо обережно."""
+    m = re.search(r"DisconSchedule\.streets\s*=\s*", html)
+    if not m:
+        return []
+    try:
+        data, _ = json.JSONDecoder().raw_decode(html[m.end():])
+    except ValueError:
+        return []
+    if isinstance(data, dict):
+        city = next((v for k, v in data.items() if "Дніпро" in str(k) and "обл" not in str(k).lower()), None)
+        data = city if city is not None else [x for v in data.values() for x in (v if isinstance(v, list) else [])]
+    if isinstance(data, dict):
+        data = list(data.keys()) if all(isinstance(v, (dict, list, int)) for v in data.values()) else list(data.values())
+    out = []
+    for x in data or []:
+        name = x.get("name") or x.get("street") if isinstance(x, dict) else x
+        if isinstance(name, str) and name.strip():
+            out.append(name.strip())
+    return out
+
+
+class _Session:
+    """Сторінка (кукі + csrf + перелік вулиць) і запити «Перевірити адресу» в одному клієнті."""
+
+    async def __aenter__(self):
+        from providers import extract_attention
+
+        self.client = httpx.AsyncClient(timeout=10, follow_redirects=True)
+        try:
+            r = await self.client.get(PAGE_URL)
+            r.raise_for_status()
+            token = re.search(r'<meta[^>]+name="csrf-token"[^>]+content="([^"]+)"', r.text)
+            if not token or "DisconSchedule" not in r.text:
+                raise ValueError("сторінка ДТЕК без csrf/DisconSchedule — схоже, антибот")
+        except BaseException:
+            await self.client.aclose()
+            raise
+        update = re.search(r'DisconSchedule\.fact\s*=\s*\{.*?"update"\s*:\s*"([^"]+)"', r.text, re.S)
+        self.update = update and update.group(1)
+        self.attention = extract_attention(r.text)
+        self.streets = parse_streets(r.text)
+        self.headers = {"X-CSRF-Token": token.group(1), "X-Requested-With": "XMLHttpRequest", "Referer": PAGE_URL}
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.client.aclose()
+
+    async def houses(self, street: str) -> list[House]:
+        rr = await self.client.post(AJAX_URL, data=_form(street, self.update), headers=self.headers)
+        rr.raise_for_status()
+        return parse_houses(street, rr.json())
+
+
+async def _remember_streets(streets: list[str]):
+    import db
+
+    if streets:
+        await db.kv_set("dtek_streets", json.dumps(streets, ensure_ascii=False))
+
+
 async def probe(streets: list[str] | None = None) -> Probe:
     """Сторінка (кукі + csrf) -> по запиту на кожну вулицю. Сайт закрився антиботом — ValueError/HTTPError."""
-    from providers import extract_attention
-
     streets = streets or DTEK_STREETS
     out = Probe()
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
-        r = await c.get(PAGE_URL)
-        r.raise_for_status()
-        token = re.search(r'<meta[^>]+name="csrf-token"[^>]+content="([^"]+)"', r.text)
-        if not token or "DisconSchedule" not in r.text:
-            raise ValueError("сторінка ДТЕК без csrf/DisconSchedule — схоже, антибот")
-        update = re.search(r'DisconSchedule\.fact\s*=\s*\{.*?"update"\s*:\s*"([^"]+)"', r.text, re.S)
-        out.attention = extract_attention(r.text)
-        headers = {"X-CSRF-Token": token.group(1), "X-Requested-With": "XMLHttpRequest", "Referer": PAGE_URL}
+    async with _Session() as s:
+        out.attention, out.streets = s.attention, s.streets
         for street in streets:
             try:
-                rr = await c.post(AJAX_URL, data=_form(street, update and update.group(1)), headers=headers)
-                rr.raise_for_status()
-                houses = parse_houses(street, rr.json())
+                houses = await s.houses(street)
             except (httpx.HTTPError, ValueError) as e:
                 log.warning("ДТЕК: вулиця %s — %r", street, e)
                 houses = []
@@ -119,8 +170,122 @@ async def probe(streets: list[str] | None = None) -> Probe:
                 out.failed.append(street)
             out.houses += houses
             await asyncio.sleep(0.3)  # не смикаємо сайт пачкою
+    await _remember_streets(out.streets)
     if not out.houses:
         raise ValueError(f"сайт ДТЕК не віддав жодного будинку ({len(streets)} вулиць)")
+    return out
+
+
+# ---------- адреса користувача ----------
+
+
+@dataclass
+class Lookup:
+    street: str | None = None  # назва вулиці як на сайті ДТЕК; None — вулицю не знайшли
+    house: House | None = None  # None — будинку немає в даних ДТЕК (можливо, ЦЕК)
+    houses_on_street: int = 0
+
+
+async def lookup(street_query: str, house: str) -> Lookup:
+    """«Яворницького», «3» -> вулиця і будинок на сайті ДТЕК (з групою і поточним станом).
+    Сайт недоступний (антибот) — ValueError/HTTPError."""
+    import db
+    from address import find_house, guess_dtek_names, match_street
+
+    async with _Session() as s:
+        await _remember_streets(s.streets)
+        known = s.streets or json.loads(await db.kv_get("dtek_streets") or "[]")
+        if known:
+            best = match_street(street_query, known)
+            candidates = [best] if best else []
+        else:
+            candidates = guess_dtek_names(street_query)
+        for name in candidates:
+            try:
+                houses = await s.houses(name)
+            except (httpx.HTTPError, ValueError) as e:
+                log.warning("ДТЕК: вулиця %s — %r", name, e)
+                continue
+            if not houses:
+                continue
+            found = find_house({h.num: h for h in houses}, house)
+            return Lookup(name, found[1] if found else None, len(houses))
+    return Lookup()
+
+
+REASON_SHORT = {
+    "emergency": "екстрене відключення",
+    "accident": "аварійні ремонтні роботи",
+    "planned": "планові ремонтні роботи",
+    "schedule": "відключення за графіком",
+}
+
+
+def reason(h: House) -> str:
+    return REASON_SHORT.get(h.kind or "", (h.sub_type or "відключення")[:80])
+
+
+def _house_off_text(street: str, num: str, h: House, head: str) -> str:
+    lines = [f"🏠 <b>{head}</b>", f"{street}, {num}", f"⚡ {reason(h)}"]
+    if h.end:
+        since = f"з {short_dt(h.start).split(' ')[0]}, " if h.start else ""
+        lines.append(f"⏱ {since}орієнтовно до <b>{short_dt(h.end)}</b>")
+    lines.append("<i>За даними сайту ДТЕК (перевірка адреси)</i>")
+    return "\n".join(lines)
+
+
+async def apply_users(probe_: Probe, users: list[dict]) -> list[tuple[int, str]]:
+    """Будинки користувачів, які вказали адресу -> особисті пуші [(user_id, текст)] + стан для «Зараз».
+    «Світло є» після відключення — лише після END_MISSES перевірок поспіль (сайт інколи блимає)."""
+    import db
+    from address import find_house
+
+    by_street: dict[str, dict[str, House]] = {}
+    for h in probe_.houses:
+        by_street.setdefault(h.street, {})[h.num] = h
+    out = []
+    now = int(time.time())
+    for u in users:
+        street, house = u.get("street") or "", u.get("house") or ""
+        if not street or not house or (u.get("provider") or "dtek") != "dtek" or street not in by_street:
+            continue  # немає адреси, ЦЕК, або сайт по цій вулиці зараз нічого не дав — нічого не знаємо
+        found = find_house(by_street[street], house)
+        if not found:
+            continue
+        num, h = found
+        off = bool(h.kind) and h.kind != "schedule"  # «за графіком» люди і так знають з графіка
+        await db.kv_set(f"house_seen:{u['id']}", json.dumps(
+            {"kind": h.kind, "reason": reason(h) if h.kind else "", "start": h.start, "end": h.end, "ts": now,
+             "groups": h.groups, "street": street, "num": num}, ensure_ascii=False,
+        ))
+        if h.groups and u.get("grp") and h.groups[0] != u["grp"]:  # ДТЕК переніс будинок в іншу чергу
+            await db.set_user(u["id"], grp=h.groups[0])
+            out.append((u["id"], f"ℹ️ За даними ДТЕК твій будинок ({street}, {num}) тепер у групі <b>{h.groups[0]}</b> "
+                                 f"(було {u['grp']}). Я оновив групу в налаштуваннях."))
+        prev = json.loads(await db.kv_get(f"house:{u['id']}") or "null")
+        if off:
+            if not prev:
+                head = "У твоєму будинку зараз немає світла"
+            elif h.end and prev.get("end") and _shift_min(h.end, prev["end"]) >= SHIFT_MIN:
+                head = "Відключення у твоєму будинку продовжено"
+            elif h.end and prev.get("end") and _shift_min(h.end, prev["end"]) <= -SHIFT_MIN:
+                head = "Відключення у твоєму будинку скорочено"
+            else:
+                head = None
+            if head and u.get("notify_on", 1):
+                out.append((u["id"], _house_off_text(street, num, h, head)))
+            await db.kv_set(f"house:{u['id']}", json.dumps({"start": h.start, "end": h.end, "miss": 0}))
+            continue
+        if not prev:
+            continue
+        miss = prev.get("miss", 0) + 1
+        if miss < END_MISSES:
+            await db.kv_set(f"house:{u['id']}", json.dumps({**prev, "miss": miss}))
+            continue
+        await db.kv_set(f"house:{u['id']}", "")
+        if u.get("notify_on", 1):
+            out.append((u["id"], f"✅ <b>У твоєму будинку світло мало з'явитися</b>\n{street}, {num}\n"
+                                 "<i>За даними сайту ДТЕК. Якщо світла ще немає — натисни «🙋 У мене є / нема світла».</i>"))
     return out
 
 
@@ -201,6 +366,10 @@ async def apply(probe_: Probe) -> list[str]:
     by_key = {h.key: h for h in probe_.houses}
     for grp in GROUPS:
         st = states.get(grp)
+        if st:  # частку бачимо завжди — навіть нижче порогу пуша («🏠 екстрене у 30 з 265 адрес групи»)
+            await db.kv_set(f"site_grp:{grp}", json.dumps(
+                {"total": st.total, "off": len(st.off), "end": st.end, "ts": int(time.time())}, ensure_ascii=False
+            ))
         prev = json.loads(await db.kv_get(f"site_em:{grp}") or "null")
         if st and st.off and len(st.off) >= MIN_SHARE * st.total:
             if prev is None:

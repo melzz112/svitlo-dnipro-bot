@@ -1,11 +1,12 @@
 from aiogram.filters.callback_data import CallbackData
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import GROUPS
 
 
 class Nav(CallbackData, prefix="nav"):
-    to: str  # menu | now | sched | chats | report | settings | groups
+    to: str  # menu | now | sched | chats | report | settings | groups | addr | addr_del
     arg: str = ""
 
 
@@ -46,10 +47,23 @@ def groups_kb(current: str | None, provider: str = "dtek"):
         b.button(text=f"✅ {name}" if code == provider else name, callback_data=SetProvider(code=code))
     for g in GROUPS:
         b.button(text=f"✅ {g}" if g == current else g, callback_data=SetGroup(code=g))
+    b.button(text="📍 Не знаю групу — визначити за адресою", callback_data=Nav(to="addr"))
     if current:
         _back(b)
-    b.adjust(2, 4, 4, 4, 1)
+    b.adjust(2, 4, 4, 4, 1, 1)
     return b.as_markup()
+
+
+def location_kb():
+    """Звичайна (не inline) клавіатура: лише вона вміє попросити геопозицію."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=LOCATION_BTN, request_location=True)], [KeyboardButton(text=CANCEL_BTN)]],
+        resize_keyboard=True, one_time_keyboard=True, input_field_placeholder="або напиши: Яворницького 3",
+    )
+
+
+LOCATION_BTN = "📍 Надіслати геопозицію"
+CANCEL_BTN = "❌ Скасувати"
 
 
 def sched_kb(day: str):
@@ -98,6 +112,14 @@ def settings_kb(user: dict):
     for m in (5, 15, 30, 60):
         mark = "✅ " if user["notify_min"] == m else ""
         b.button(text=f"{mark}{m} хв", callback_data=Notify(value=m))
+    rows = [1, 1, 4]
+    if user.get("street") and user.get("house"):
+        b.button(text=f"📍 {user['street']}, {user['house']}"[:60], callback_data=Nav(to="addr"))
+        b.button(text="🗑 Видалити адресу", callback_data=Nav(to="addr_del"))
+        rows += [1, 1]
+    else:
+        b.button(text="📍 Вказати адресу — сповіщення по будинку", callback_data=Nav(to="addr"))
+        rows += [1]
     _back(b)
-    b.adjust(1, 1, 4, 1)
+    b.adjust(*rows, 1)
     return b.as_markup()
