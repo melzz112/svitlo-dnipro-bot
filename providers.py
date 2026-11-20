@@ -28,6 +28,8 @@ Schedule = dict[str, dict[str, list[Slot]]]
 DTEK_URL = "https://www.dtek-dnem.com.ua/ua/shutdowns"
 YASNO_URL = "https://app.yasno.ua/api/blackout-service/public/shutdowns/regions/{region}/dsos/{dso}/planned-outages"
 YASNO_OPERATORS = {"dnipro": {"dtek": (3, 301), "cek": (3, 303)}, "kyiv": {"dtek": (25, 902)}}
+# Відкритий агрегатор (той самий формат, що віддає сайт ДТЕК, але готовим JSON — без антибота).
+OUA_URL = "https://raw.githubusercontent.com/Baskerville42/outage-data-ua/main/data/dnipro.json"
 
 
 @dataclass
@@ -40,7 +42,7 @@ class DaySchedule:
     def label(self) -> str | None:
         if self.source == "demo" or not self.groups:
             return None
-        name = {"dtek": "сайт ДТЕК", "yasno": "сайт YASNO", "channel": "Telegram-канали"}[self.source]
+        name = {"dtek": "сайт ДТЕК", "yasno": "сайт YASNO", "oua": "відкриті дані outage-data-ua", "channel": "Telegram-канали"}[self.source]
         if self.updated:
             return f"🕒 Оновлено {escape(self.updated)} · {name}"
         return f"ℹ️ Джерело: {name}"
@@ -163,6 +165,40 @@ async def fetch_yasno(today: date, provider: str) -> dict[str, DaySchedule]:
     return parse_yasno_schedule(r.json(), today)
 
 
+def _oua_group_key(provider: str, grp: str) -> str:
+    """Ключ групи в JSON outage-data-ua: ДТЕК 'GPV1.1', ЦЕК 'GPV1001.1'."""
+    if provider == "cek":
+        q, s = grp.split(".")
+        return f"GPV100{q}.{s}"
+    return f"GPV{grp}"
+
+
+async def fetch_outage_data_ua(today: date, provider: str) -> dict[str, DaySchedule]:
+    """Резервне джерело для ДТЕК: відкритий агрегатор outage-data-ua (готовий JSON сайту ДТЕК, оновлюється часто).
+    Беремо лише фактичний графік (fact) на сьогодні/завтра. ЦЕК у fact немає (лише тижневий шаблон у preset),
+    тому для ЦЕК джерело не використовується. Немає графіка на завтра — не помилка, просто порожньо."""
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+        r = await c.get(OUA_URL)
+        r.raise_for_status()
+    data = r.json()
+    if (data.get("lastUpdateStatus") or {}).get("ok") is False:
+        raise ValueError(f"outage-data-ua: останнє оновлення невдале: {data.get('lastUpdateStatus')}")
+    fact = data.get("fact") or {}
+    if not fact.get("data"):
+        raise ValueError("outage-data-ua: немає fact.data")
+    by_date = {datetime.fromtimestamp(int(ts), TZ).date(): groups for ts, groups in fact["data"].items()}
+    out: dict[str, DaySchedule] = {}
+    for day, d in schedule_dates(today).items():
+        groups = {
+            g: parse_dtek_hours(hours)
+            for g in GROUPS
+            if (hours := (by_date.get(d) or {}).get(_oua_group_key(provider, g)))
+        }
+        if groups:
+            out[day] = DaySchedule(groups, "oua", fact.get("update"))
+    return out
+
+
 def demo_schedule() -> Schedule:
     """Стабільні фейкові дані на день — щоб тестити меню без API."""
     rnd = random.Random(time.strftime("%Y%m%d"))
@@ -176,7 +212,7 @@ def demo_schedule() -> Schedule:
 
 
 SITE_CACHE_SEC = 60
-SITE_RETRY_SEC = {"dtek": 30 * 60, "yasno": 60}
+SITE_RETRY_SEC = {"dtek": 30 * 60, "yasno": 60, "oua": 5 * 60}
 # Якщо сайт на хвилину не відповів — тримаємо його останню відповідь, а не стрибаємо на графік з каналів:
 # він може відрізнятись, і бот розсилав би «оновився» туди-сюди.
 SITE_STALE_SEC = 3 * 3600
@@ -209,7 +245,12 @@ async def _site_schedule(source: str, provider: str, today: date) -> dict[str, D
                 return snapshot if snapshot is not None else _stale(key, today)
         try:
             async with asyncio.timeout(7):
-                snapshot = await (fetch_dtek(today) if source == "dtek" else fetch_yasno(today, provider))
+                if source == "dtek":
+                    snapshot = await fetch_dtek(today)
+                elif source == "yasno":
+                    snapshot = await fetch_yasno(today, provider)
+                else:
+                    snapshot = await fetch_outage_data_ua(today, provider)
         except (httpx.HTTPError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as exc:
             log.warning("%s schedule for %s unavailable: %r", source, provider, exc)
             _site_cache[key] = (today, time.monotonic() + SITE_RETRY_SEC[source], None)
@@ -231,6 +272,9 @@ async def get_schedule_days(provider="dtek", *, today: date | None = None) -> di
         days.update(await _site_schedule("dtek", provider, today) or {})
     if dates.keys() - days.keys():
         for day, schedule in (await _site_schedule("yasno", provider, today) or {}).items():
+            days.setdefault(day, schedule)
+    if provider == "dtek" and dates.keys() - days.keys():  # у outage-data-ua фактичний графік лише ДТЕК
+        for day, schedule in (await _site_schedule("oua", provider, today) or {}).items():
             days.setdefault(day, schedule)
     for day, d in dates.items():
         if day not in days:

@@ -77,6 +77,8 @@ class ScheduleSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertCountEqual(requests, [
             "/api/blackout-service/public/shutdowns/regions/3/dsos/301/planned-outages",
             "/api/blackout-service/public/shutdowns/regions/3/dsos/303/planned-outages",
+            # «завтра» немає в YASNO -> для ДТЕК пробуємо outage-data-ua (для ЦЕК — ні, там немає фактичного графіка)
+            "/Baskerville42/outage-data-ua/main/data/dnipro.json",
         ])
 
     async def test_dtek_block_page_uses_yasno_without_reading_telegram(self):

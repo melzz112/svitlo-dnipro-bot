@@ -24,7 +24,7 @@ def _slots_str(slots) -> str:
     return ", ".join(parts) or "без відключень"
 
 
-SITE_SOURCES = ("dtek", "yasno")  # «офіційніші» за Telegram-канали
+SITE_SOURCES = ("dtek", "yasno", "oua")  # «офіційніші» за Telegram-канали
 
 
 def _pkey(provider: str, name: str) -> str:
