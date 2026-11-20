@@ -1,14 +1,15 @@
 """Джерела графіків. Формат: {"today": {"1.1": [Slot,...], ...}, "tomorrow": {...}}"""
+import asyncio
 import json
 import logging
 import random
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from html import escape
 
 import httpx
-
-from datetime import datetime, timedelta
 
 from config import CITY, GROUPS, SOURCE, TZ
 
@@ -24,11 +25,26 @@ class Slot:
 
 Schedule = dict[str, dict[str, list[Slot]]]
 
-YASNO_URL = "https://api.yasno.com.ua/api/v1/pages/home/schedule-turn-off-electricity"
 DTEK_URL = "https://www.dtek-dnem.com.ua/ua/shutdowns"
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+YASNO_URL = "https://app.yasno.ua/api/blackout-service/public/shutdowns/regions/{region}/dsos/{dso}/planned-outages"
+YASNO_OPERATORS = {"dnipro": {"dtek": (3, 301), "cek": (3, 303)}, "kyiv": {"dtek": (25, 902)}}
 
-last_update: str | None = None  # "19.11.2026 21:01" з сайту ДТЕК
+
+@dataclass
+class DaySchedule:
+    groups: dict[str, list[Slot]] = field(default_factory=dict)
+    source: str = "channel"
+    updated: str | None = None
+    emergency: bool = False
+
+    def label(self) -> str | None:
+        if self.source == "demo" or not self.groups:
+            return None
+        name = {"dtek": "сайт ДТЕК", "yasno": "сайт YASNO", "channel": "Telegram-канали"}[self.source]
+        if self.updated:
+            return f"🕒 Оновлено {escape(self.updated)} · {name}"
+        return f"ℹ️ Джерело: {name}"
+
 
 # Значення години в JSON ДТЕК -> які півгодини без світла і якого типу
 _DTEK_HALVES = {
@@ -57,46 +73,94 @@ def parse_dtek_hours(hours: dict[str, str]) -> list[Slot]:
     return slots
 
 
-async def fetch_dtek() -> Schedule:
-    global last_update
-    async with httpx.AsyncClient(timeout=30, headers={"User-Agent": UA}, follow_redirects=True) as c:
+def schedule_dates(today: date) -> dict[str, date]:
+    return {"today": today, "tomorrow": today + timedelta(days=1)}
+
+
+async def fetch_dtek(today: date) -> dict[str, DaySchedule]:
+    async with httpx.AsyncClient(timeout=5, follow_redirects=True) as c:
         r = await c.get(DTEK_URL)
         r.raise_for_status()
-    m = re.search(r"DisconSchedule\.fact\s*=\s*(\{.*?\})\s*</script>", r.text, re.S)
+    m = re.search(r"DisconSchedule\.fact\s*=\s*(\{.*?\})\s*;?\s*</script>", r.text, re.S)
     if not m:
         raise ValueError("DisconSchedule.fact не знайдено на сторінці ДТЕК")
     fact = json.loads(m.group(1))
-    last_update = fact.get("update")
-    today = int(fact["today"])
-    data = fact.get("data", {})
-    out: Schedule = {}
-    for day, ts in (("today", today), ("tomorrow", today + 86400)):
-        groups = data.get(str(ts))
-        if groups:
-            out[day] = {g.removeprefix("GPV"): parse_dtek_hours(h) for g, h in groups.items()}
-        else:
-            out[day] = {}
-    return out
-
-
-async def fetch_yasno() -> Schedule:
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get(YASNO_URL)
-        r.raise_for_status()
-        data = r.json()
-    comp = next(x for x in data.get("components", []) if "dailySchedule" in x)
-    city = comp["dailySchedule"][CITY]
-    out: Schedule = {}
-    for day in ("today", "tomorrow"):
-        groups = (city.get(day) or {}).get("groups") or {}
-        out[day] = {
-            g: [
-                Slot(s["start"], s["end"], "off" if s.get("type") == "DEFINITE_OUTAGE" else "maybe")
-                for s in slots
-            ]
-            for g, slots in groups.items()
+    by_date = {datetime.fromtimestamp(int(ts), TZ).date(): groups for ts, groups in fact["data"].items()}
+    out = {}
+    for day, d in schedule_dates(today).items():
+        groups = {
+            g: parse_dtek_hours(hours)
+            for g in GROUPS
+            if (hours := (by_date.get(d) or {}).get(f"GPV{g}"))
         }
+        if groups:
+            out[day] = DaySchedule(groups, "dtek", fact.get("update"))
+    if not out:
+        raise ValueError("На сайті ДТЕК немає графіка на сьогодні або завтра")
     return out
+
+
+_YASNO_SLOT_TYPES = {"Definite": "off", "Possible": "maybe", "NotPlanned": None}
+
+
+def _yasno_slots(slots: list[dict]) -> list[Slot] | None:
+    if not slots:
+        return None
+    out = []
+    for slot in slots:
+        start, end, kind = slot["start"], slot["end"], slot["type"]
+        if kind not in _YASNO_SLOT_TYPES or not 0 <= start < end <= 1440:
+            return None
+        if outage := _YASNO_SLOT_TYPES[kind]:
+            out.append(Slot(start / 60, end / 60, outage))
+    return out
+
+
+def parse_yasno_schedule(data: dict, today: date) -> dict[str, DaySchedule]:
+    out = {}
+    waiting = False
+    for day, d in schedule_dates(today).items():
+        result = DaySchedule(source="yasno")
+        stamps = []
+        for group in GROUPS:
+            entry = data.get(group) or {}
+            info = entry.get(day) or {}
+            if not info.get("date") or date.fromisoformat(info["date"][:10]) != d:
+                continue
+            status = info.get("status")
+            if status == "WaitingForSchedule":
+                waiting = True
+                continue
+            if status == "EmergencyShutdowns":
+                result.emergency = True
+                out[day] = result
+                continue
+            if status == "NoOutages":
+                slots = []
+            elif status == "ScheduleApplies":
+                slots = _yasno_slots(info.get("slots") or [])
+                if slots is None:
+                    continue
+            else:
+                continue
+            result.groups[group] = slots
+            out[day] = result
+            if stamp := entry.get("updatedOn"):
+                stamps.append(datetime.fromisoformat(stamp))
+        if stamps:
+            result.updated = max(stamps).astimezone(TZ).strftime("%d.%m.%Y %H:%M")
+    if not out and not waiting:
+        raise ValueError("YASNO не повернув актуальних даних про графік")
+    return out
+
+
+async def fetch_yasno(today: date, provider: str) -> dict[str, DaySchedule]:
+    city = CITY if SOURCE == "yasno" and provider == "dtek" else "dnipro"
+    region, dso = YASNO_OPERATORS[city][provider]
+    async with httpx.AsyncClient(timeout=5) as c:
+        r = await c.get(YASNO_URL.format(region=region, dso=dso))
+        r.raise_for_status()
+    return parse_yasno_schedule(r.json(), today)
 
 
 def demo_schedule() -> Schedule:
@@ -111,67 +175,55 @@ def demo_schedule() -> Schedule:
     return out
 
 
-_cache: tuple[float, Schedule] | None = None
-_site_fail_ts = 0.0
-SITE_RETRY_SEC = 30 * 60  # сайт ДТЕК за Incapsula: після відмови не стукаємо пів години
-dtek_source = "site"  # site | channel — звідки зараз графік ДТЕК (для підпису «Оновлено …»)
-
-FETCHERS = {"dtek": fetch_dtek, "yasno": fetch_yasno}
+SITE_CACHE_SEC = 60
+SITE_RETRY_SEC = {"dtek": 30 * 60, "yasno": 60}
+_site_cache: dict[tuple[str, str], tuple[date, float, dict[str, DaySchedule] | None]] = {}
+_site_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
 
-async def channel_schedule(provider: str) -> Schedule:
-    """Графік, який userbot зібрав з постів у Telegram-каналах (db.save_channel_schedule)."""
-    import db  # тут, щоб providers не тягнув БД при імпорті
-
-    today = datetime.now(TZ).date()
-    out: Schedule = {}
-    for day, d in (("today", today), ("tomorrow", today + timedelta(days=1))):
-        groups, _ = await db.get_channel_schedule(provider, d.isoformat())
-        out[day] = {g: [Slot(a, b) for a, b in v] for g, v in groups.items()}
-    return out
-
-
-async def _site_schedule(force=False) -> Schedule | None:
-    """Сайт ДТЕК: кеш 5 хв (🔄 — не частіше раз на хвилину). None, якщо недоступний."""
-    global _cache, _site_fail_ts
-    if _cache:
-        age = time.time() - _cache[0]
-        if age < 60 or (not force and age < 300):
-            return _cache[1]
-    if time.time() - _site_fail_ts < SITE_RETRY_SEC:
-        return None
-    try:
-        sch = await FETCHERS.get(SOURCE, fetch_dtek)()
-    except Exception as e:  # 403 від Incapsula, сайт лежить або змінився — беремо з каналів
-        log.warning("%s site unavailable, using Telegram channels: %r", SOURCE, e)
-        _site_fail_ts, _cache = time.time(), None
-        return None
-    if not (sch.get("today") or sch.get("tomorrow")):
-        return None
-    _cache = (time.time(), sch)
-    return sch
-
-
-async def update_label(provider="dtek") -> str | None:
-    """Рядок «🕒 Оновлено …» для екрана графіка і пушів."""
-    if provider == "dtek" and dtek_source == "site":
-        return f"🕒 Оновлено ДТЕК: {last_update}" if last_update else None
+async def channel_schedule(provider: str, day: date) -> DaySchedule:
     import db
 
-    _, upd = await db.get_channel_schedule(provider, datetime.now(TZ).date().isoformat())
-    name = "ЦЕК" if provider == "cek" else "ДТЕК"
-    return f"🕒 Графік {name} з Telegram-каналів, оновлено {upd}" if upd else None
+    groups, stamp = await db.get_channel_schedule(provider, day.isoformat())
+    return DaySchedule({g: [Slot(a, b) for a, b in spans] for g, spans in groups.items()}, "channel", stamp)
 
 
-async def get_schedule(force=False, provider="dtek") -> Schedule:
-    """ЦЕК — лише з каналів. ДТЕК — з сайту, а якщо сайт недоступний — з каналів."""
-    global dtek_source
-    if provider == "cek":
-        return await channel_schedule("cek")
+async def _site_schedule(source: str, provider: str, today: date) -> dict[str, DaySchedule] | None:
+    key = (source, provider)
+    async with _site_locks.setdefault(key, asyncio.Lock()):
+        if cached := _site_cache.get(key):
+            day, expires, snapshot = cached
+            if time.monotonic() < expires and (snapshot is None or day == today):
+                return snapshot
+        try:
+            async with asyncio.timeout(7):
+                snapshot = await (fetch_dtek(today) if source == "dtek" else fetch_yasno(today, provider))
+        except (httpx.HTTPError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            log.warning("%s schedule for %s unavailable: %r", source, provider, exc)
+            _site_cache[key] = (today, time.monotonic() + SITE_RETRY_SEC[source], None)
+            return None
+        _site_cache[key] = (today, time.monotonic() + SITE_CACHE_SEC, snapshot)
+        return snapshot
+
+
+async def get_schedule_days(provider="dtek", *, today: date | None = None) -> dict[str, DaySchedule]:
+    if today is None:
+        today = datetime.now(TZ).date()
     if SOURCE == "demo":
-        return demo_schedule()
-    if site := await _site_schedule(force):
-        dtek_source = "site"
-        return site
-    dtek_source = "channel"
-    return await channel_schedule("dtek")
+        return {day: DaySchedule(groups, "demo") for day, groups in demo_schedule().items()}
+
+    dates = schedule_dates(today)
+    days = {}
+    if provider == "dtek" and SOURCE != "yasno":
+        days.update(await _site_schedule("dtek", provider, today) or {})
+    if dates.keys() - days.keys():
+        for day, schedule in (await _site_schedule("yasno", provider, today) or {}).items():
+            days.setdefault(day, schedule)
+    for day, d in dates.items():
+        if day not in days:
+            days[day] = await channel_schedule(provider, d)
+    return days
+
+
+async def get_schedule(provider="dtek") -> Schedule:
+    return {day: schedule.groups for day, schedule in (await get_schedule_days(provider)).items()}

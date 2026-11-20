@@ -207,7 +207,7 @@ async def latest_alert(grp, hours=6, provider="dtek"):
     return rows[0] if rows else None
 
 
-# --- графіки з постів у Telegram-каналах (ЦЕК завжди, ДТЕК — коли сайт недоступний) ---
+# --- резервні графіки з постів у Telegram-каналах ---
 async def save_channel_schedule(provider: str, day: str, groups: dict, updated: str):
     """day 'YYYY-MM-DD'; groups {"1.1": [[9.5, 13.0], ...]}. Злиття: коригування може мати не всі групи."""
     cur = json.loads(await kv_get(f"gpv:{provider}:{day}") or "{}")

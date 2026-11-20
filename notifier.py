@@ -2,7 +2,7 @@
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from html import escape
 
 from aiogram import Bot
@@ -48,20 +48,20 @@ async def _send(bot: Bot, uid: int, text: str):
 
 async def tick(bot: Bot):
     today = datetime.now(TZ).date()
-    dates = {"today": today, "tomorrow": today + timedelta(days=1)}
+    dates = providers.schedule_dates(today)
     users = await db.users_with_group()
     t = now_h()
     initialized = await db.kv_get("sched_init") is not None  # перший прохід після деплою — без пушів
 
-    for prov in db.PROVIDERS:
-        sch = await get_schedule(provider=prov)
-        label = await providers.update_label(prov)
+    schedules = await asyncio.gather(*(providers.get_schedule_days(prov, today=today) for prov in db.PROVIDERS))
+    for prov, days in zip(db.PROVIDERS, schedules):
         name = db.PROVIDER_NAME[prov]
 
         # 1) графік оновився / з'явився -> шлемо новий графік
         changes: dict[str, list[str]] = {}  # grp -> готові тексти
         for day, d in dates.items():
-            for grp, slots in sch.get(day, {}).items():
+            schedule = days[day]
+            for grp, slots in schedule.groups.items():
                 key, new = f"{_pkey(prov, 'sched')}:{d}:{grp}", _slots_str(slots)
                 old = await db.kv_get(key)
                 if old == new:
@@ -75,10 +75,10 @@ async def tick(bot: Bot):
                 else:
                     head = f"🔄 <b>{name}: графік на {title.lower()} оновився</b>\nБуло: {old}\nСтало: <b>{new}</b>"
                 text = f"{head}\n\n{day_text(grp, slots, title)}"
-                if label:
+                if label := schedule.label():
                     text += f"\n\n{label}"
                 changes.setdefault(grp, []).append(text)
-        if prov == "dtek" and not initialized and any(sch.get(d) for d in dates):
+        if not initialized and any(schedule.groups for schedule in days.values()):
             await db.kv_set("sched_init", "1")
 
         for u in users:
@@ -88,7 +88,7 @@ async def tick(bot: Bot):
                 await _send(bot, u["id"], text)
                 await asyncio.sleep(0.05)
             # 2) попередження перед відключенням
-            for s in sch.get("today", {}).get(u["grp"], []):
+            for s in days["today"].groups.get(u["grp"], []):
                 if s.kind != "off":
                     continue
                 left = (s.start - t) * 60

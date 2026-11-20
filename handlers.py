@@ -8,8 +8,7 @@ from aiogram.types import CallbackQuery, Message
 
 import db
 import keyboards as kb
-import providers
-from providers import get_schedule
+from providers import get_schedule, get_schedule_days
 from render import day_text, now_status
 from status import verdict
 
@@ -21,7 +20,7 @@ PICK_TEXT = (
     "🔢 потім свою <b>групу</b> відключень.\n\n"
     "Зараз: <b>{prov}</b>"
 )
-CHANNEL_NOTE = "\n\nℹ️ Графік {prov} бот бере з Telegram-каналів — щойно його там опублікують, він з'явиться тут і прийде пуш."
+CHANNEL_NOTE = "\n\nℹ️ Графіка поки немає і в Telegram-каналах."
 ICON = {"on": "💡", "off": "🕯"}
 
 
@@ -92,15 +91,17 @@ async def _need_group(cb: CallbackQuery):
 async def sched(cb: CallbackQuery, callback_data: kb.Nav):
     if not (u := await _need_group(cb)):
         return
-    day, _, refresh = callback_data.arg.partition("-")
-    s = await get_schedule(force=bool(refresh), provider=_prov(u))
+    day = "tomorrow" if callback_data.arg.partition("-")[0] == "tomorrow" else "today"
+    schedule = (await get_schedule_days(_prov(u)))[day]
     title = "Сьогодні" if day == "today" else "Завтра"
-    slots = s.get(day, {}).get(u["grp"])
+    slots = schedule.groups.get(u["grp"])
     text = f"🏢 {_pname(u)}\n" + day_text(u["grp"], slots, title)
-    if label := await providers.update_label(_prov(u)):
+    if slots is not None and (label := schedule.label()):
         text += f"\n\n{label}"
-    if slots is None and (_prov(u) == "cek" or providers.dtek_source == "channel"):
-        text += CHANNEL_NOTE.format(prov=_pname(u))
+    elif slots is None and schedule.emergency:
+        text += "\n\n🚨 За даними YASNO діють екстрені відключення."
+    elif slots is None and schedule.source == "channel":
+        text += CHANNEL_NOTE
     await edit(cb, text, kb.sched_kb(day))
 
 
