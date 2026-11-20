@@ -328,6 +328,22 @@ async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str
         await m.answer(PICK_TEXT.format(prov="ЦЕК"), reply_markup=kb.groups_kb(u["grp"], "cek"))
         return
     h = res.house
+    if h.cek:  # сайт ДТЕК позначив будинок як ЦЕК
+        cek_grp = dtek_site.cek_group(h)
+        if cek_grp:
+            await db.set_user(m.from_user.id, provider="cek", grp=cek_grp, street="", house="")
+            await m.answer(
+                f"🏠 {escape(res.street)}, {escape(h.num)}\nЗа даними сайту ДТЕК твій будинок обслуговує <b>ЦЕК</b> · "
+                f"група <b>{cek_grp}</b>. Поставив ЦЕК {cek_grp}.\n\nℹ️ Сповіщень саме по будинку для ЦЕК поки немає — "
+                "лише графік, аварії з каналів і те, що пишуть люди.", reply_markup=ReplyKeyboardRemove())
+            await m.answer(_menu_text(await db.get_user(m.from_user.id)), reply_markup=kb.main_menu())
+        else:
+            await m.answer(
+                f"🏠 {escape(res.street)}, {escape(h.num)}\nЗа даними сайту ДТЕК твій будинок обслуговує <b>ЦЕК</b>. "
+                "Обери групу ЦЕК вручну (є в рахунку за світло).", reply_markup=ReplyKeyboardRemove())
+            u = await db.get_user(m.from_user.id)
+            await m.answer(PICK_TEXT.format(prov="ЦЕК"), reply_markup=kb.groups_kb(u["grp"], "cek"))
+        return
     grp = h.groups[0] if h.groups else None
     fields = {"street": res.street, "house": h.num, "provider": "dtek"}
     if grp:

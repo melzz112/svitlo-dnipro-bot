@@ -36,6 +36,7 @@ class House:
     sub_type: str = ""
     start: str = ""  # «13:16 20.11.2026»
     end: str = ""
+    cek: str = ""  # поле «cek» у відповіді сайту: не порожнє — будинок, схоже, обслуговує ЦЕК
 
     @property
     def key(self) -> str:
@@ -79,9 +80,19 @@ def parse_houses(street: str, payload) -> list[House]:
             if (m := re.fullmatch(r"GPV([1-6]\.[12])", str(reason).strip())) and m.group(1) in GROUPS:
                 groups.add(m.group(1))
         sub = str(h.get("sub_type") or "").strip()
+        cek = h.get("cek")
+        cek = "" if cek in (None, False, "", 0, "0") else (json.dumps(cek, ensure_ascii=False) if isinstance(cek, (dict, list)) else str(cek))
         out.append(House(street, str(num), sorted(groups), classify(sub), sub,
-                         str(h.get("start_date") or "").strip(), str(h.get("end_date") or "").strip()))
+                         str(h.get("start_date") or "").strip(), str(h.get("end_date") or "").strip(), cek.strip()))
     return out
+
+
+def cek_group(h: House) -> str | None:
+    """З поля «cek» дістаємо чергу ЦЕК, якщо вона там є («2.1», «GPV1002.1», «ЦЕК 2.1»). Формат поля невідомий."""
+    if m := re.search(r"GPV100([1-6])\.([12])", h.cek):
+        return f"{m.group(1)}.{m.group(2)}"
+    m = re.search(r"(?<![\d.])([1-6])\.([12])(?![\d])", h.cek)
+    return f"{m.group(1)}.{m.group(2)}" if m else None
 
 
 def _form(street: str, update: str | None) -> dict[str, str]:
@@ -93,8 +104,10 @@ def _form(street: str, update: str | None) -> dict[str, str]:
     return data
 
 
-def parse_streets(html: str) -> list[str]:
-    """`DisconSchedule.streets = {...}` зі сторінки -> вулиці м. Дніпро. Формат не документований — розбираємо обережно."""
+def parse_streets(html: str, city: str = CITY) -> list[str]:
+    """`DisconSchedule.streets = {"с. Філія": ["вул. Лісова"], …, "м. Дніпро": ["вул. Микитинська", "тупик Орільський", …]}`
+    -> вулиці саме цього населеного пункту, як є (їх і шлемо в «Перевірити адресу»).
+    Ключ — точно «м. Дніпро»: «смт Дніпровське» чи «м. Дніпрорудне» теж містять «Дніпро», але це інші місця."""
     m = re.search(r"DisconSchedule\.streets\s*=\s*", html)
     if not m:
         return []
@@ -103,16 +116,11 @@ def parse_streets(html: str) -> list[str]:
     except ValueError:
         return []
     if isinstance(data, dict):
-        city = next((v for k, v in data.items() if "Дніпро" in str(k) and "обл" not in str(k).lower()), None)
-        data = city if city is not None else [x for v in data.values() for x in (v if isinstance(v, list) else [])]
-    if isinstance(data, dict):
-        data = list(data.keys()) if all(isinstance(v, (dict, list, int)) for v in data.values()) else list(data.values())
-    out = []
-    for x in data or []:
-        name = x.get("name") or x.get("street") if isinstance(x, dict) else x
-        if isinstance(name, str) and name.strip():
-            out.append(name.strip())
-    return out
+        want = re.sub(r"\s+", " ", city).strip().lower()
+        data = next((v for k, v in data.items() if re.sub(r"\s+", " ", str(k)).strip().lower() == want), None)
+    if not isinstance(data, list):
+        return []  # міста в переліку немає — lookup підбере назву сам (guess_dtek_names)
+    return [x.strip() for x in data if isinstance(x, str) and x.strip()]
 
 
 class _Session:
@@ -250,7 +258,7 @@ async def apply_users(probe_: Probe, users: list[dict]) -> list[tuple[int, str]]
         if not street or not house or (u.get("provider") or "dtek") != "dtek" or street not in by_street:
             continue  # немає адреси, ЦЕК, або сайт по цій вулиці зараз нічого не дав — нічого не знаємо
         found = find_house(by_street[street], house)
-        if not found:
+        if not found or found[1].cek:  # будинок ЦЕК — у ДТЕК його стан не показується
             continue
         num, h = found
         off = bool(h.kind) and h.kind != "schedule"  # «за графіком» люди і так знають з графіка
@@ -316,6 +324,8 @@ def _dt_key(s: str):
 def group_states(houses: list[House]) -> dict[str, GroupState]:
     out: dict[str, GroupState] = {}
     for h in houses:
+        if h.cek:  # будинки ЦЕК не рахуємо в групах ДТЕК
+            continue
         for g in h.groups:
             st = out.setdefault(g, GroupState(g))
             st.total += 1

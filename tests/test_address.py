@@ -60,17 +60,71 @@ class StreetMatchTests(unittest.TestCase):
     def test_guess_names_without_street_list(self):
         self.assertEqual(address.guess_dtek_names("Соколина вулиця"), ["вул. Соколина"])
         self.assertEqual(address.guess_dtek_names("Яворницького")[0], "вул. Яворницького")
+        self.assertEqual(address.guess_dtek_names("Орільський тупик"), ["тупик Орільський"])  # як на сайті
+
+    def test_real_dtek_street_names(self):
+        real = ["вул. Микитинська", "тупик Орільський", "пров. Янтарний"]
+        cases = {"Орільський тупик": "тупик Орільський", "тупик Орільський": "тупик Орільський",
+                 "МИКИТИНСЬКА": "вул. Микитинська", "Янтарный переулок": "пров. Янтарний", "янтарний": "пров. Янтарний"}
+        for q, exp in cases.items():
+            self.assertEqual(address.match_street(q, real), exp, q)
+
+
+class StreetListTests(unittest.TestCase):
+    def test_exact_page_format(self):
+        html = ('<script>DisconSchedule.streets = {"с. Філія":["вул. Лісова"],"с. Новопавлівка":["пров. Незламності",'
+                '"пров. Запорізький","вул. Поштова"],"м. Дніпро":["вул. Микитинська","тупик Орільський","пров. Янтарний"]}'
+                '</script>')
+        self.assertEqual(dtek_site.parse_streets(html), ["вул. Микитинська", "тупик Орільський", "пров. Янтарний"])
+
+    def test_only_dnipro_city_not_similar_names(self):
+        self.assertEqual(dtek_site.parse_streets(f"<script>{streets_js()};</script>"), STREETS)  # не «смт Дніпровське»
+        no_city = 'DisconSchedule.streets = {"смт Дніпровське":["вул. Степова"],"м. Дніпрорудне":["вул. Шахтарська"]}'
+        self.assertEqual(dtek_site.parse_streets(no_city), [])
+        self.assertEqual(dtek_site.parse_streets("<html>без переліку</html>"), [])
+
+    def test_exact_ajax_response(self):
+        houses = dtek_site.parse_houses("вул. Микитинська", envelope({"1": real_house(
+            EMERGENCY, "13:16 20.11.2026", "17:16 20.11.2026")}))
+        h = houses[0]
+        self.assertEqual((h.num, h.groups, h.kind, h.start, h.end, h.cek),
+                         ("1", ["1.2"], "emergency", "13:16 20.11.2026", "17:16 20.11.2026", ""))
+
+    def test_cek_field(self):
+        houses = dtek_site.parse_houses("вул. Х", envelope({
+            "1": real_house(cek="2.1"), "2": real_house(cek={"group": "GPV1003.2"}), "3": real_house(cek=True)}))
+        self.assertEqual([dtek_site.cek_group(h) for h in houses], ["2.1", "3.2", None])
+        self.assertTrue(all(h.cek for h in houses))
+        self.assertEqual(dtek_site.group_states(houses), {})  # будинки ЦЕК не рахуються в групах ДТЕК
+
+
+def streets_js(streets=STREETS):
+    """Точний формат зі сторінки: населені пункти — ключі; «смт Дніпровське» стоїть ПЕРЕД «м. Дніпро»."""
+    data = {"с. Філія": ["вул. Лісова"], "с. Новопавлівка": ["пров. Незламності", "пров. Запорізький", "вул. Поштова"],
+            "смт Дніпровське": ["вул. Степова", "вул. Соколина"], "м. Дніпро": streets}
+    return "DisconSchedule.streets = " + json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
 def page(streets=STREETS):
     return ('<html><head><meta name="csrf-token" content="tok"></head><body><script>'
             'DisconSchedule.fact = {"data": {}, "update": "20.11.2026 13:35", "today": 1}</script><script>'
-            f'DisconSchedule.streets = {json.dumps({"м. Дніпро": streets}, ensure_ascii=False)};</script></body></html>')
+            f'{streets_js(streets)}</script></body></html>')
+
+
+def real_house(sub="", start="", end="", grp="1.2", cek=None):
+    """Будинок точно як у відповіді сайту (разом із voluntarily і cek)."""
+    return {**house(sub, start, end, grp), "cek": cek}
+
+
+def envelope(data: dict) -> dict:
+    """Відповідь «Перевірити адресу» з усіма полями, як віддає сайт."""
+    return {"result": True, "data": data, "showCurOutageParam": True, "showCurSchedule": True, "showTableSchedule": True,
+            "showTablePlan": False, "showTableFact": True, "showUserGroup": True, "updateTimestamp": "15:33 20.11.2026"}
 
 
 def yavornytskoho(num3=None):
-    """Будинки на просп. Яворницького: 3 (група 1.2, стан num3), 5 (1.2, світло є)."""
-    return {"result": True, "data": {"3": num3 or house(), "5": house(), "14А": house(grp="3.1")}}
+    """Будинки на просп. Яворницького: 3 (група 1.2, стан num3), 5 (1.2, світло є), 14А (3.1)."""
+    return envelope({"3": num3 or real_house(), "5": real_house(), "14А": real_house(grp="3.1")})
 
 
 def mock_site(street_houses: dict, page_html=None):
@@ -158,6 +212,10 @@ class HouseWatchTests(DbCase):
         out = await self.run_probe(None)
         self.assertIn("світло мало з'явитися", out[0][1])
         self.assertEqual(await self.run_probe(None), [])
+
+    async def test_cek_house_is_not_watched(self):
+        self.assertEqual(await self.run_probe(real_house(EMERGENCY, "13:16 20.11.2026", "18:05 20.11.2026", cek="1.2")), [])
+        self.assertIsNone(await db.kv_get("house_seen:1"))
 
     async def test_schedule_outage_is_not_pushed_but_seen(self):
         sched = house("Стабілізаційне відключення (Згідно графіку погодинних відключень)", "16:30 20.11.2026", "20:30 20.11.2026")
@@ -257,6 +315,16 @@ class DialogTests(DbCase):
             await handlers.addr_text(m, self.state)
         self.assertTrue(any("ЦЕК" in t for t, _ in m.answers))
         self.assertEqual((await db.get_user(1))["street"], "")
+
+    async def test_cek_house_by_dtek_site(self):
+        h = dtek_site.parse_houses("вул. Соколина", envelope({"12": real_house(cek="2.1")}))[0]
+        await self.state.set_state(handlers.Addr.waiting)
+        m = FakeMsg("Соколина 12")
+        with patch.object(dtek_site, "lookup", AsyncMock(return_value=dtek_site.Lookup("вул. Соколина", h, 1))):
+            await handlers.addr_text(m, self.state)
+        u = await db.get_user(1)
+        self.assertEqual((u["provider"], u["grp"], u["street"]), ("cek", "2.1", ""))
+        self.assertTrue(any("обслуговує <b>ЦЕК</b>" in t for t, _ in m.answers))
 
     async def test_site_down(self):
         await self.state.set_state(handlers.Addr.waiting)
