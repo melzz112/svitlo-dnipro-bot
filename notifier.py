@@ -81,7 +81,7 @@ async def tick(bot: Bot):
                     continue
                 await db.kv_set(key, new)
                 await db.kv_set(src_key, schedule.source)
-                if not initialized:
+                if not initialized or (day == "today" and emergency):  # сьогоднішній графік зараз не діє
                     continue
                 title = "Сьогодні" if day == "today" else "Завтра"
                 if old is None:

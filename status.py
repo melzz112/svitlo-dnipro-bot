@@ -8,6 +8,7 @@
 import re
 import time
 from datetime import datetime, timedelta
+from html import escape
 
 import db
 from config import TZ
@@ -48,6 +49,35 @@ async def _outage_chain(grp, provider, now):
     if not active:
         return None, None
     return active[-1], active[0]["ts"]
+
+
+def is_emergency_alert(a: dict | None) -> bool:
+    return bool(a) and "екстрен" in a["text"].lower()
+
+
+async def emergency_today(grp: str, provider: str) -> str | None:
+    """Що показати замість графіка на сьогодні, поки діють екстрені (у місті або по групі). None — графік діє."""
+    now = datetime.now(TZ)
+    city = await db.get_emergency(provider)
+    alert, _ = await _outage_chain(grp, provider, now)
+    alert = alert if is_emergency_alert(alert) else None
+    if not city and not alert:
+        return None
+    lines = [
+        "🚨 <b>Зараз діють екстрені відключення</b>",
+        "Графік не діє — світло вимикають без графіка, за командами Укренерго.",
+        "",
+    ]
+    if alert:
+        lines.append(f"🔴 Група <b>{grp}</b> зараз без світла")
+        for icon in ("⏱", "🏠"):  # «з 13:16, орієнтовно до 17:16 20.11», «без світла 3 з 4 адрес»
+            if m := re.search(icon + r" ([^\n]*)", alert["text"]):
+                lines.append(f"{icon} {m.group(1)}")
+    else:
+        lines.append(f"Що з групою <b>{grp}</b> саме зараз — у «⚡ Зараз».")
+    if city and city.get("text"):
+        lines += ["", f"<i>{escape(city['text'])}</i>"]
+    return "\n".join(lines)
 
 
 def _label(alert_text: str) -> str:
@@ -143,7 +173,7 @@ async def verdict(grp: str, provider: str) -> str:
         lines.append("🚨 У Дніпрі діють екстрені відключення — графік зараз не діє")
     elif not alert and n_off >= 2 and not slot:
         lines.append("❓ Ні в графіку, ні в каналах відключення немає — можливо, локальна аварія")
-    if not city_em and (sched_line := _schedule_line(today_slots, slot, t)):
+    if not city_em and not is_emergency_alert(alert) and (sched_line := _schedule_line(today_slots, slot, t)):
         lines.append(sched_line)
     return "\n".join(lines).rstrip()
 

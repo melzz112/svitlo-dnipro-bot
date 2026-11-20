@@ -12,7 +12,7 @@ import keyboards as kb
 from providers import get_schedule_days
 from config import TZ
 from render import day_text
-from status import verdict
+from status import emergency_today, verdict
 
 router = Router()
 
@@ -94,12 +94,16 @@ async def sched(cb: CallbackQuery, callback_data: kb.Nav):
     if not (u := await _need_group(cb)):
         return
     day = "tomorrow" if callback_data.arg.partition("-")[0] == "tomorrow" else "today"
-    schedule = (await get_schedule_days(_prov(u)))[day]
     title = "Сьогодні" if day == "today" else "Завтра"
+    if day == "today" and (em := await emergency_today(u["grp"], _prov(u))):
+        # під час екстрених графік на сьогодні не діє — не показуємо його, щоб не вводити в оману
+        await edit(cb, f"🏢 {_pname(u)}\n📅 <b>{title}</b> · група <b>{u['grp']}</b>\n\n{em}", kb.sched_kb(day))
+        return
+    schedule = (await get_schedule_days(_prov(u)))[day]
     slots = schedule.groups.get(u["grp"])
     text = f"🏢 {_pname(u)}\n" + day_text(u["grp"], slots, title)
-    if day == "today" and await db.get_emergency(_prov(u)):
-        text = "🚨 <b>Зараз у Дніпрі діють екстрені відключення — графік не діє</b>\n\n" + text
+    if slots and await db.get_emergency(_prov(u)):
+        text += "\n\n⚠️ Зараз діють екстрені — графік на завтра діятиме, якщо їх скасують."
     if slots is not None and (label := schedule.label()):
         text += f"\n\n{label}"
     elif slots is None and schedule.emergency:

@@ -10,6 +10,8 @@ import httpx
 
 import db
 import dtek_site
+import handlers
+import keyboards as kb
 import notifier
 import providers
 import status
@@ -256,6 +258,60 @@ class CityEmergencyTests(DbTestCase):
         sent = self.sent()
         self.assertEqual([uid for uid, _ in sent], [1])
         self.assertIn("екстрене відключення", sent[0][1])
+
+
+class ScheduleScreenTests(DbTestCase):
+    async def open_sched(self, day):
+        cb = AsyncMock()
+        cb.from_user.id = 1
+        days = {
+            "today": providers.DaySchedule({"1.2": [Slot(7.5, 10), Slot(16.5, 20.5)]}, "dtek", "20.11.2026 13:35"),
+            "tomorrow": providers.DaySchedule({"1.2": [Slot(6, 10)]}, "dtek", "20.11.2026 13:35"),
+        }
+        with patch.object(handlers, "get_schedule_days", AsyncMock(return_value=days)):
+            await handlers.sched(cb, kb.Nav(to="sched", arg=day))
+        return cb.message.edit_text.await_args.args[0]
+
+    async def test_today_shows_emergency_instead_of_schedule(self):
+        self.assertIn("16:30–20:30", await self.open_sched("today"))  # без екстрених — звичайний графік
+
+        await db.set_emergency("dtek", {"since": int(time.time()), "text": DNIPRO_NOW, "source": "oua"})
+        text = await self.open_sched("today")
+        self.assertIn("Зараз діють екстрені відключення", text)
+        self.assertIn("Графік не діє", text)
+        self.assertNotIn("07:30", text)
+        self.assertNotIn("🟥", text)
+        self.assertIn("у «⚡ Зараз»", text)
+
+        await dtek_site.apply(dtek_site.Probe(dtek_site.parse_houses("вул. Микитинська", street_payload())))
+        text = await self.open_sched("today")
+        self.assertIn("🔴 Група <b>1.2</b> зараз без світла", text)
+        self.assertIn("з 13:16, орієнтовно до <b>17:16 20.11</b>", text)
+        self.assertIn("3 з 4", text)
+
+        tomorrow = await self.open_sched("tomorrow")
+        self.assertIn("06:00–10:00", tomorrow)
+        self.assertIn("якщо їх скасують", tomorrow)
+
+    async def test_group_emergency_alone_also_hides_schedule(self):
+        await dtek_site.apply(dtek_site.Probe(dtek_site.parse_houses("вул. Микитинська", street_payload())))
+        text = await self.open_sched("today")
+        self.assertIn("Зараз діють екстрені", text)
+        self.assertNotIn("16:30", text)
+        self.assertNotIn("16:30", await self.verdict())
+
+    async def test_today_schedule_updates_are_not_pushed_during_emergency(self):
+        async def fetch(provider, *, today):
+            return {"today": providers.DaySchedule({"3.1": [Slot(18, 20)]}, "dtek"),
+                    "tomorrow": providers.DaySchedule({"3.1": [Slot(8, 10)]}, "dtek")}
+
+        await db.kv_set("sched_init", "1")
+        await db.set_emergency("dtek", {"since": int(time.time()), "text": "", "source": "oua"})
+        with patch.object(providers, "get_schedule_days", fetch), patch.object(notifier, "now_h", return_value=13.5):
+            await notifier.tick(self.bot)
+        texts = [t for uid, t in self.sent() if uid == 2]
+        self.assertEqual(len(texts), 1)
+        self.assertIn("на завтра", texts[0])
 
 
 class GetEmergencyTests(unittest.IsolatedAsyncioTestCase):
