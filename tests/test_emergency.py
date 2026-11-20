@@ -281,7 +281,7 @@ class ScheduleScreenTests(DbTestCase):
         self.assertIn("Графік не діє", text)
         self.assertNotIn("07:30", text)
         self.assertNotIn("🟥", text)
-        self.assertIn("у «⚡ Зараз»", text)
+        self.assertNotIn("у «⚡ Зараз»", text)  # без зайвого «що з групою — у Зараз»
 
         await dtek_site.apply(dtek_site.Probe(dtek_site.parse_houses("вул. Микитинська", street_payload())))
         text = await self.open_sched("today")

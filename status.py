@@ -67,15 +67,12 @@ async def emergency_today(grp: str, provider: str) -> str | None:
     lines = [
         "🚨 <b>Зараз діють екстрені відключення</b>",
         "Графік не діє — світло вимикають без графіка, за командами Укренерго.",
-        "",
     ]
     if alert:
-        lines.append(f"🔴 Група <b>{grp}</b> зараз без світла")
+        lines += ["", f"🔴 Група <b>{grp}</b> зараз без світла"]
         for icon in ("⏱", "🏠"):  # «з 13:16, орієнтовно до 17:16 20.11», «без світла 3 з 4 адрес»
             if m := re.search(icon + r" ([^\n]*)", alert["text"]):
                 lines.append(f"{icon} {m.group(1)}")
-    else:
-        lines.append(f"Що з групою <b>{grp}</b> саме зараз — у «⚡ Зараз».")
     if city and city.get("text"):
         lines += ["", f"<i>{escape(city['text'])}</i>"]
     return "\n".join(lines)
