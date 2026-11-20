@@ -145,6 +145,32 @@ async def crowd(minutes=15, provider="dtek"):
     return out
 
 
+async def crowd_people(grp: str, provider: str, since: float) -> dict[str, tuple[str, int]]:
+    """Хто що писав про групу з моменту since: {людина: (останній стан, коли)}. Для екрана «Зараз»."""
+    out: dict[str, tuple[str, int]] = {}
+    rows = await _all(
+        f"SELECT who, event, ts, text FROM chat_msgs WHERE ts>=? AND (','||grp||',') LIKE ? AND "
+        f"{_chat_provider_sql(provider)} ORDER BY ts",
+        (int(since), f"%,{grp},%"),
+    )
+    for r in rows:
+        out[r["who"] or f"m{r['ts']}{r['text'][:20]}"] = (r["event"], r["ts"])
+    for r in await _all(
+        "SELECT user_id, status, ts FROM reports WHERE grp=? AND provider=? AND ts>=? ORDER BY ts",
+        (grp, provider, int(since)),
+    ):
+        out[f"bot{r['user_id']}"] = (r["status"], r["ts"])
+    return out
+
+
+async def off_alerts(grp: str, provider: str, hours=12):
+    since = int(time.time()) - hours * 3600
+    return await _all(
+        "SELECT * FROM alerts WHERE kind='off' AND grp=? AND provider IN (?, '*') AND ts>=? ORDER BY ts",
+        (grp, provider, since),
+    )
+
+
 async def chat_stats(minutes=30, provider="dtek"):
     """{"1.1": {"off": 5, "on": 1}, ...} — повідомлення людей з чатів по групах."""
     since = int(time.time()) - minutes * 60
