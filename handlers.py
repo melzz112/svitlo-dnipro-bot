@@ -140,7 +140,7 @@ async def chats(cb: CallbackQuery):
         head += f"За 30 хв: 💡 «є» — {c.get('on', 0)}, 🕯 «нема» — {c.get('off', 0)}\n\n"
     msgs = await db.recent_chat_msgs(g, p)
     if not msgs:
-        text = head + f"За останні 2 год про групу {g} ніхто не писав «дали» чи «вимкнули»."
+        text = head + f"За останні 2 год про групу {g} ніхто не писав."
     else:
         lines = []
         for r in msgs:
