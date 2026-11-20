@@ -7,11 +7,12 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from html import escape
+from html import escape, unescape
 
 import httpx
 
 from config import CITY, GROUPS, SOURCE, TZ
+from parse import emergency_in_city
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +47,41 @@ class DaySchedule:
         if self.updated:
             return f"🕒 Оновлено {escape(self.updated)} · {name}"
         return f"ℹ️ Джерело: {name}"
+
+
+@dataclass
+class Emergency:
+    """Режим екстрених відключень у місті: графік не діє, вимикають без попередження."""
+    active: bool
+    text: str = ""  # офіційний текст ДТЕК («Шановні клієнти!»); з YASNO — порожній
+    source: str = "dtek"  # dtek | oua | yasno
+
+
+# Текст вікна «Шановні клієнти!» з останньої вдалої відповіді: source -> (time.monotonic(), текст або None)
+_notices: dict[str, tuple[float, str | None]] = {}
+
+
+def set_notice(source: str, text: str | None):
+    _notices[source] = (time.monotonic(), text)
+
+
+def extract_attention(html: str) -> str | None:
+    """Вікно «Шановні клієнти!» (div.m-attention__text) на сторінці ДТЕК -> звичайний текст, рядки через \\n."""
+    i = html.find('class="m-attention__text"')
+    if i < 0:
+        return None
+    start = html.find(">", i) + 1
+    depth, body = 1, None
+    for m in re.finditer(r"<(/?)div\b[^>]*>", html[start:], re.I):
+        depth += -1 if m.group(1) else 1
+        if depth == 0:
+            body = html[start:start + m.start()]
+            break
+    if body is None:
+        return None
+    body = unescape(re.sub(r"<[^>]*>", "", re.sub(r"<br\s*/?>|</p>", "\n", body, flags=re.I)))
+    lines = (re.sub(r"\s+", " ", x).strip() for x in body.split("\n"))
+    return "\n".join(x for x in lines if x) or None
 
 
 # Значення години в JSON ДТЕК -> які півгодини без світла і якого типу
@@ -87,6 +123,7 @@ async def fetch_dtek(today: date) -> dict[str, DaySchedule]:
     if not m:
         raise ValueError("DisconSchedule.fact не знайдено на сторінці ДТЕК")
     fact = json.loads(m.group(1))
+    set_notice("dtek", extract_attention(r.text))
     by_date = {datetime.fromtimestamp(int(ts), TZ).date(): groups for ts, groups in fact["data"].items()}
     out = {}
     for day, d in schedule_dates(today).items():
@@ -183,6 +220,8 @@ async def fetch_outage_data_ua(today: date, provider: str) -> dict[str, DaySched
     data = r.json()
     if (data.get("lastUpdateStatus") or {}).get("ok") is False:
         raise ValueError(f"outage-data-ua: останнє оновлення невдале: {data.get('lastUpdateStatus')}")
+    if provider == "dtek":  # dnipro.json — це сторінка ДТЕК, вікно «Шановні клієнти!» теж її
+        _oua_notice(data)
     fact = data.get("fact") or {}
     if not fact.get("data"):
         raise ValueError("outage-data-ua: немає fact.data")
@@ -197,6 +236,21 @@ async def fetch_outage_data_ua(today: date, provider: str) -> dict[str, DaySched
         if groups:
             out[day] = DaySchedule(groups, "oua", fact.get("update"))
     return out
+
+
+OUA_MAX_AGE = timedelta(hours=3)  # якщо агрегатор давно не оновлювався — його «екстрені» вже не новина
+
+
+def _oua_notice(data: dict):
+    try:
+        updated = datetime.fromisoformat(data["lastUpdated"].replace("Z", "+00:00"))
+    except (KeyError, AttributeError, TypeError, ValueError):
+        return
+    if datetime.now(TZ) - updated > OUA_MAX_AGE:
+        log.warning("outage-data-ua не оновлювався з %s — текст ДТЕК не враховуємо", updated)
+        return
+    att = data.get("attention")
+    set_notice("oua", att.get("text") if isinstance(att, dict) else att)
 
 
 def demo_schedule() -> Schedule:
@@ -280,6 +334,29 @@ async def get_schedule_days(provider="dtek", *, today: date | None = None) -> di
         if day not in days:
             days[day] = await channel_schedule(provider, d)
     return days
+
+
+async def get_emergency(provider="dtek", *, today: date | None = None) -> Emergency | None:
+    """Чи діють зараз екстрені відключення в місті. None — жодне джерело не відповіло, стан невідомий.
+    ДТЕК: вікно «Шановні клієнти!» з сайту ДТЕК (напряму або через outage-data-ua) — там перелічені міста,
+    тож воно точніше; YASNO (статус EmergencyShutdowns на всю ДТЕК-область) — лише якщо вікна не дістали.
+    ЦЕК: лише YASNO."""
+    if SOURCE == "demo":
+        return None
+    if today is None:
+        today = datetime.now(TZ).date()
+    if provider == "dtek" and CITY == "dnipro":
+        if SOURCE != "yasno":
+            await _site_schedule("dtek", provider, today)
+        await _site_schedule("oua", provider, today)
+        fresh = [(at, src, text) for src, (at, text) in _notices.items() if time.monotonic() - at < SITE_STALE_SEC]
+        if fresh:
+            _, src, text = max(fresh)
+            return Emergency(emergency_in_city(text), text or "", src)
+    yasno = await _site_schedule("yasno", provider, today)
+    if yasno and (d := yasno.get("today")):
+        return Emergency(d.emergency, "", "yasno")
+    return None
 
 
 async def get_schedule(provider="dtek") -> Schedule:

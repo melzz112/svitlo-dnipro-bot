@@ -5,15 +5,17 @@ import time
 from datetime import datetime
 from html import escape
 
+import httpx
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError
 
 import db
+import dtek_site
 import keyboards as kb
 import providers
-from config import CROWD_MIN, TZ
+from config import CITY, CROWD_MIN, DTEK_PROBE_SEC, SOURCE, TZ
 from providers import get_schedule
-from render import day_text, hm, now_h
+from render import day_text, hm, now_h, now_status
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +61,7 @@ async def tick(bot: Bot):
     schedules = await asyncio.gather(*(providers.get_schedule_days(prov, today=today) for prov in db.PROVIDERS))
     for prov, days in zip(db.PROVIDERS, schedules):
         name = db.PROVIDER_NAME[prov]
+        emergency = await db.get_emergency(prov)
 
         # 1) графік оновився / з'явився -> шлемо новий графік
         changes: dict[str, list[str]] = {}  # grp -> готові тексти
@@ -98,8 +101,8 @@ async def tick(bot: Bot):
             for text in changes.get(u["grp"], []):
                 await _send(bot, u["id"], text)
                 await asyncio.sleep(0.05)
-            # 2) попередження перед відключенням
-            for s in days["today"].groups.get(u["grp"], []):
+            # 2) попередження перед відключенням (під час екстрених графік не діє — «через 15 хв вимкнуть» було б неправдою)
+            for s in [] if emergency else days["today"].groups.get(u["grp"], []):
                 if s.kind != "off":
                     continue
                 left = (s.start - t) * 60
@@ -121,14 +124,20 @@ async def _contradicted_by_chats(a: dict) -> bool:
     return n_off >= 2 and n_off >= n_on
 
 
+ALERT_FOOTER = {"channel": "За даними Telegram-каналів", "dteksite": "Офіційно — сайт ДТЕК, перевірка адрес групи"}
+OFFICIAL_SRC = ("dteksite",)
+
+
 async def send_alerts(bot: Bot):
-    """Події з каналів (юзербот кладе в alerts) -> людям потрібної групи і постачальника, загальні — всім."""
+    """Події з каналів і сайту ДТЕК (юзербот кладе в alerts) -> людям потрібної групи і постачальника,
+    загальні — всім. Офіційні (сайт ДТЕК) — одразу, без звірки з чатами."""
     alerts = await db.pending_alerts()
     if not alerts:
         return
     users = [u for u in await db.users_with_group() if u["notify_on"]]
     for a in alerts:
-        if a["kind"] == "on":
+        src = a.get("src") or "channel"
+        if a["kind"] == "on" and src not in OFFICIAL_SRC:
             if time.time() - a["ts"] < ON_HOLD_SEC:
                 continue  # ще чекаємо, що скажуть люди
             if await _contradicted_by_chats(a):
@@ -136,9 +145,13 @@ async def send_alerts(bot: Bot):
                 log.info("alert %s dropped: chats say no power", a["key"])
                 continue
         await db.mark_alert_sent(a["key"])
+        prov = a.get("provider") or "dtek"
+        if a["kind"] in ("on", "off") and prov in db.PROVIDERS:
+            # група вже знає — «люди пишуть» з тим самим не дублюємо
+            await db.kv_set(f"{_pkey(prov, 'crowd')}:{a['grp']}", a["kind"])
         for u in users:
-            if _matches(a.get("provider") or "dtek", u) and (a["grp"] == "*" or a["grp"] == u["grp"]):
-                await _send(bot, u["id"], a["text"] + "\n\n<i>За даними Telegram-каналів</i>")
+            if _matches(prov, u) and (a["grp"] == "*" or a["grp"] == u["grp"]):
+                await _send(bot, u["id"], a["text"] + f"\n\n<i>{ALERT_FOOTER.get(src, ALERT_FOOTER['channel'])}</i>")
                 await asyncio.sleep(0.05)  # ліміт Telegram ~30 повідомлень/с
 
 
@@ -158,11 +171,14 @@ async def crowd_check(bot: Bot):
             continue
         sch = await get_schedule(provider=prov)
         name = db.PROVIDER_NAME[prov]
+        emergency = await db.get_emergency(prov)
+        # під час екстрених «вимкнули» майже напевно правда — вистачає двох людей, щоб пушнути швидше
+        min_off = min(CROWD_MIN, 2) if emergency else CROWD_MIN
         for grp, c in data.items():
             n_on, n_off = len(c["on"]), len(c["off"])
             if n_on >= CROWD_MIN and n_on >= 2 * n_off:
                 new = "on"
-            elif n_off >= CROWD_MIN and n_off >= 2 * n_on:
+            elif n_off >= min_off and n_off >= 2 * n_on:
                 new = "off"
             else:
                 continue
@@ -170,7 +186,7 @@ async def crowd_check(bot: Bot):
             prev = await db.kv_get(f"{skey}:{grp}")
             if prev is None:  # ще не знаємо — беремо з каналів/графіка
                 a = await db.latest_alert(grp, hours=12, provider=prov)
-                off = (a and a["kind"] == "off" and a["grp"] == grp) or _now_off_by_schedule(sch, grp)
+                off = (a and a["kind"] == "off" and a["grp"] == grp) or (not emergency and _now_off_by_schedule(sch, grp))
                 prev = "off" if off else "on"
             if new == prev:
                 continue
@@ -183,11 +199,17 @@ async def crowd_check(bot: Bot):
             if new == "on":
                 what = "почали вмикати світло" if n_off else "дали світло"
                 head, n = f"💡 <b>Люди пишуть: {name} {grp} — {what}</b>", n_on
+            elif emergency:
+                head, n = f"🚨 <b>{name} {grp}: вимкнули світло — екстрене відключення</b>", n_off
             else:
                 head, n = f"🕯 <b>Люди пишуть: {name} {grp} — вимкнули світло</b>", n_off
             text = f"{head}\n👥 {n} людей за 15 хв"
             if places := [p for p, _ in c["places"].most_common(4)]:
                 text += "\n📍 " + ", ".join(escape(p) for p in places)
+            if emergency:
+                text += "\n⚠️ У місті діють екстрені — можуть знову вимкнути будь-коли" if new == "on" else (
+                    "\n🚨 У місті офіційно діють екстрені відключення, графік не діє"
+                )
             text += "\n\n<i>Неофіційно — за повідомленнями в чатах</i>"
 
             users = users if users is not None else [u for u in await db.users_with_group() if u["notify_on"]]
@@ -198,15 +220,95 @@ async def crowd_check(bot: Bot):
             log.info("crowd %s %s -> %s (%d on / %d off)", prov, grp, new, n_on, n_off)
 
 
+EMERGENCY_OFF_SEC = 10 * 60  # «скасували» підтверджуємо 10 хв — разовий збій джерела не смикає людей
+NOTICE_SOURCE = {"dtek": "сайт ДТЕК", "oua": "сайт ДТЕК (через outage-data-ua)", "yasno": "YASNO"}
+
+
+async def emergency_check(bot: Bot):
+    """Офіційно оголосили екстрені відключення в місті -> одразу пуш усім абонентам постачальника (усім групам);
+    скасували -> «знову діє графік». Стан лежить у БД — за ним же екран «Зараз» пише «світла немає, екстрене»."""
+    users = None
+    for prov in db.PROVIDERS:
+        em = await providers.get_emergency(prov)
+        if em is None:
+            continue  # джерела мовчать — стан не чіпаємо
+        state = await db.get_emergency(prov)
+        name, now, off_key = db.PROVIDER_NAME[prov], int(time.time()), f"emerg_off:{prov}"
+        sch = None
+        if em.active:
+            await db.kv_set(off_key, "")
+            if state:
+                if em.text and em.text != state.get("text"):  # ДТЕК дописав район — оновлюємо мовчки
+                    await db.set_emergency(prov, {**state, "text": em.text, "source": em.source})
+                continue
+            await db.set_emergency(prov, {"since": now, "text": em.text, "source": em.source})
+            text = (
+                f"🚨 <b>{name}: у Дніпрі екстрені відключення</b>\n"
+                "Графік зараз не діє — світло можуть вимкнути будь-якої миті, без попередження."
+            )
+            if em.text:
+                text += f"\n\n<i>{escape(em.text)}</i>"
+            text += f"\n\nℹ️ Джерело: {NOTICE_SOURCE[em.source]}. Що з твоєю групою — у «⚡ Зараз»."
+        else:
+            if not state:
+                continue
+            off_since = int(await db.kv_get(off_key) or 0)
+            if not off_since:
+                await db.kv_set(off_key, str(now))
+                continue
+            if now - off_since < EMERGENCY_OFF_SEC:
+                continue
+            await db.set_emergency(prov, None)
+            await db.kv_set(off_key, "")
+            text = f"✅ <b>{name}: екстрені відключення в Дніпрі скасували</b>\nЗнову діє графік.\n\n"
+            sch = await get_schedule(provider=prov)
+        log.info("emergency %s -> %s (%s)", prov, em.active, em.source)
+        users = users if users is not None else [u for u in await db.users_with_group() if u["notify_on"]]
+        for u in users:
+            if _prov(u) == prov:
+                await _send(bot, u["id"], text + (now_status(sch.get("today", {}).get(u["grp"])) if sch else ""))
+                await asyncio.sleep(0.05)
+
+
+SITE_FAIL_SEC = 5 * 60  # сайт закрився антиботом — пробуємо знову за 5 хв
+_site_next = 0.0
+_site_warned = 0.0
+
+
+async def site_check(bot: Bot):
+    """Сайт ДТЕК, «Перевірити адресу» по контрольних вулицях (раз на DTEK_PROBE_SEC) -> екстрене по групах ->
+    alerts, які send_alerts розсилає тут же. Так «по групі 1.2 вимкнули екстрено» доходить за хвилину."""
+    global _site_next, _site_warned
+    if not DTEK_PROBE_SEC or SOURCE != "dtek" or CITY != "dnipro" or time.monotonic() < _site_next:
+        return
+    _site_next = time.monotonic() + DTEK_PROBE_SEC
+    try:
+        probe = await dtek_site.probe()
+    except (httpx.HTTPError, ValueError) as e:
+        _site_next = time.monotonic() + SITE_FAIL_SEC
+        log.warning("сайт ДТЕК: перевірка адрес не вдалась: %r", e)
+        return
+    providers.set_notice("dtek", probe.attention)  # заодно свіже вікно «Шановні клієнти!»
+    for change in await dtek_site.apply(probe):
+        log.info("сайт ДТЕК: %s", change)
+    if time.monotonic() - _site_warned > 3600:
+        _site_warned = time.monotonic()
+        missing = [g for g, n in dtek_site.coverage(probe.houses).items() if not n]
+        if missing or probe.failed:
+            log.warning(
+                "сайт ДТЕК: немає контрольних адрес груп %s; вулиці без відповіді: %s — додай вулиці в DTEK_STREETS",
+                ", ".join(missing) or "—", ", ".join(probe.failed) or "—",
+            )
+
+
 async def loop(bot: Bot, every=60):
+    """Сайт ДТЕК — раз на хвилину; аварії, «люди пишуть» і екстрені — кожні 15 с; графік — раз на хвилину."""
     n = 0
     while True:
-        try:
-            await send_alerts(bot)
-            await crowd_check(bot)
-            if n % 4 == 0:  # графік — раз на хвилину, аварії — кожні 15 с
-                await tick(bot)
-        except Exception:
-            log.exception("notifier tick failed")
+        for job in (site_check, send_alerts, crowd_check, emergency_check) + ((tick,) if n % 4 == 0 else ()):
+            try:
+                await job(bot)
+            except Exception:
+                log.exception("notifier %s failed", job.__name__)
         n += 1
         await asyncio.sleep(every // 4)

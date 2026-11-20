@@ -98,6 +98,8 @@ async def sched(cb: CallbackQuery, callback_data: kb.Nav):
     title = "Сьогодні" if day == "today" else "Завтра"
     slots = schedule.groups.get(u["grp"])
     text = f"🏢 {_pname(u)}\n" + day_text(u["grp"], slots, title)
+    if day == "today" and await db.get_emergency(_prov(u)):
+        text = "🚨 <b>Зараз у Дніпрі діють екстрені відключення — графік не діє</b>\n\n" + text
     if slots is not None and (label := schedule.label()):
         text += f"\n\n{label}"
     elif slots is None and schedule.emergency:

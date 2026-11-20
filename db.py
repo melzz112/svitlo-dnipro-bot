@@ -34,6 +34,7 @@ MIGRATIONS = [
     ("users", "provider", "'dtek'"),
     ("reports", "provider", "'dtek'"),
     ("alerts", "provider", "'dtek'"),  # 'dtek' | 'cek' | '*'
+    ("alerts", "src", "'channel'"),  # 'channel' — канали-агрегатори, 'dteksite' — перевірка адрес на сайті ДТЕК
 ]
 
 PROVIDERS = ("dtek", "cek")
@@ -195,11 +196,11 @@ async def recent_chat_msgs(grp, provider="dtek", hours=2, limit=10):
 
 
 # --- alerts з каналів ---
-async def add_alert(key, kind, grp, until, text, provider="dtek") -> bool:
+async def add_alert(key, kind, grp, until, text, provider="dtek", src="channel") -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT OR IGNORE INTO alerts(key, kind, grp, until, text, ts, provider) VALUES(?,?,?,?,?,?,?)",
-            (key, kind, grp, until, text, int(time.time()), provider),
+            "INSERT OR IGNORE INTO alerts(key, kind, grp, until, text, ts, provider, src) VALUES(?,?,?,?,?,?,?,?)",
+            (key, kind, grp, until, text, int(time.time()), provider, src),
         )
         await db.commit()
         return cur.rowcount > 0
@@ -215,11 +216,12 @@ async def mark_alert_sent(key):
     await _exec("UPDATE alerts SET sent=1 WHERE key=?", (key,))
 
 
-async def last_alert(kind, grp, minutes, provider="dtek"):
+async def last_alert(kind, grp, minutes, provider="dtek", src=None):
     since = int(time.time()) - int(minutes * 60)
     rows = await _all(
-        "SELECT * FROM alerts WHERE kind=? AND grp=? AND provider IN (?, '*') AND ts>=? ORDER BY ts DESC LIMIT 1",
-        (kind, grp, provider, since),
+        "SELECT * FROM alerts WHERE kind=? AND grp=? AND provider IN (?, '*') AND ts>=?"
+        + (" AND src=?" if src else "") + " ORDER BY ts DESC LIMIT 1",
+        (kind, grp, provider, since) + ((src,) if src else ()),
     )
     return rows[0] if rows else None
 
@@ -274,3 +276,14 @@ async def kv_get(k):
 
 async def kv_set(k, v):
     await _exec("INSERT OR REPLACE INTO kv VALUES(?,?)", (k, v))
+
+
+# --- режим екстрених відключень (стан веде notifier, читає екран «Зараз») ---
+async def get_emergency(provider: str) -> dict | None:
+    """{"since": ts, "text": офіційний текст, "source": ...} поки діють екстрені, інакше None."""
+    v = await kv_get(f"emerg:{provider}")
+    return json.loads(v) if v else None
+
+
+async def set_emergency(provider: str, state: dict | None):
+    await kv_set(f"emerg:{provider}", json.dumps(state, ensure_ascii=False) if state else "")

@@ -455,3 +455,36 @@ STREET_RE = re.compile(
 def find_street(raw: str) -> str | None:
     m = STREET_RE.search(norm(raw))
     return m.group(1).strip() if m else None
+
+
+# ---------- 3) вікно «Шановні клієнти!» на сайті ДТЕК ----------
+# «За наказом НЕК Укренерго в м. Дніпро, Кам'янське, Самар … р-ни діють екстрені відключення.
+#  Для решти області стабілізаційні відключення.» — графік у місті тоді не діє.
+EMERGENCY_RE = re.compile(
+    r"екстрен\w*\s+(?:відключ|знеструм)|графік\w*\s+аварійних|(?<!\w)гав(?!\w)|графік\w*\s+(?:зараз\s+)?не\s+ді"
+)
+# «скасовано», «щоб уникнути екстрених відключень», «можливі екстрені» — режиму зараз немає
+NOT_ACTIVE_RE = re.compile(
+    r"скасов|припинен|завершен|відмін|уникн|запобіг|не допуст|можлив|екстрен\w*\s+відключ\w*\s+не\s+(?:ді|застосов)"
+)
+CITY_RE = re.compile(r"(?<!\w)дніпр[оіа](?!\w)")  # м. Дніпро / у Дніпрі, але не «Дніпровський р-н»
+WHOLE_REGION_RE = re.compile(r"област|(?<!\w)(?:всій|усій)(?!\w)")
+EXCEPT_RE = re.compile(r"(?<!\w)(?:крім|окрім|за винятком|решт\w*|інш\w*)(?!\w)")
+
+
+def emergency_in_city(text: str | None) -> bool:
+    """Текст вікна «Шановні клієнти!» -> чи діють екстрені відключення саме в м. Дніпро.
+    Дивимось по реченнях: «… діють екстрені. Для решти області стабілізаційні» — так;
+    «екстрені по області, крім м. Дніпро» / «для решти області екстрені» — ні."""
+    if not text:
+        return False
+    t = re.sub(r"(?<!\w)(м|с|смт|вул|обл)\.", r"\1 ", norm(text).lower())  # «м. Дніпро» не ріже речення
+    for s in re.split(r"[.!;\n]+", t):
+        if not EMERGENCY_RE.search(s) or NOT_ACTIVE_RE.search(s):
+            continue
+        if city := CITY_RE.search(s):
+            if not EXCEPT_RE.search(s[: city.start()][-40:]):
+                return True
+        elif WHOLE_REGION_RE.search(s) and not EXCEPT_RE.search(s):
+            return True
+    return False
