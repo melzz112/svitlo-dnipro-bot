@@ -21,7 +21,7 @@ from telethon.tl.types import ChatInviteAlready, PeerUser
 
 import db
 from config import API_HASH, API_ID, CHANNELS, CHATS, TZ
-from parse import dedup_text, parse_cek_schedule, parse_channel, parse_user, ukey
+from parse import dedup_text, parse_channel, parse_schedule_posts, parse_user, ukey
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("userbot")
@@ -63,13 +63,31 @@ async def handle_post(raw: str):
         await _handle_post(raw)
 
 
+async def save_schedules(raw: str, when: datetime) -> int:
+    """Графіки ДТЕК/ЦЕК з поста -> БД. when — час поста (для постів без дати = «сьогодні» на момент поста)."""
+    n = 0
+    for prov, day, groups in parse_schedule_posts(raw, when.date()):
+        await db.save_channel_schedule(prov, day.isoformat(), groups, when.strftime("%H:%M %d.%m"))
+        log.info("schedule %s %s: %d груп", prov, day, len(groups))
+        n += 1
+    return n
+
+
+async def backfill(client, channels, limit=40):
+    """При старті: дочитуємо останні пости, щоб графік на сьогодні/завтра був одразу (лише графіки, без пушів)."""
+    for ch in channels:
+        try:
+            msgs = [m async for m in client.iter_messages(ch, limit=limit) if m.raw_text]
+        except Exception as e:
+            log.warning("backfill %s failed: %r", getattr(ch, "username", ch), e)
+            continue
+        for m in reversed(msgs):  # від старих до нових — новіші коригування перекривають
+            await save_schedules(m.raw_text, m.date.astimezone(TZ))
+
+
 async def _handle_post(raw: str):
-    """Пост каналу -> графік ЦЕК у БД і/або alerts з антиспамом."""
-    now = datetime.now(TZ)
-    if cek := parse_cek_schedule(raw, now.date()):
-        day, groups = cek
-        await db.save_cek_schedule(day.isoformat(), groups, now.strftime("%H:%M %d.%m"))
-        log.info("CEK schedule %s: %d груп", day, len(groups))
+    """Пост каналу -> графіки в БД і/або alerts з антиспамом."""
+    await save_schedules(raw, datetime.now(TZ))
     for a in parse_channel(raw):
         if a.kind == "general":
             # загальних — не частіше раз на 30 хв (крім «скасовано»: це важливо)
@@ -140,6 +158,7 @@ async def main():
         return
 
     channels, discussions = await resolve(client, CHANNELS)
+    await backfill(client, channels)
     user_chats = discussions
     for c in CHATS:
         if ent := await get_chat(client, c):

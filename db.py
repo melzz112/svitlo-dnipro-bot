@@ -207,17 +207,17 @@ async def latest_alert(grp, hours=6, provider="dtek"):
     return rows[0] if rows else None
 
 
-# --- графіки ЦЕК (з постів у каналах) ---
-async def save_cek_schedule(day: str, groups: dict, updated: str):
-    """day 'YYYY-MM-DD'; groups {"1.1": [[9.5, 13.0], ...]}. Злиття: пост зі змінами може мати не всі групи."""
-    cur = json.loads(await kv_get(f"cekgpv:{day}") or "{}")
+# --- графіки з постів у Telegram-каналах (ЦЕК завжди, ДТЕК — коли сайт недоступний) ---
+async def save_channel_schedule(provider: str, day: str, groups: dict, updated: str):
+    """day 'YYYY-MM-DD'; groups {"1.1": [[9.5, 13.0], ...]}. Злиття: коригування може мати не всі групи."""
+    cur = json.loads(await kv_get(f"gpv:{provider}:{day}") or "{}")
     cur.update({g: [list(x) for x in v] for g, v in groups.items()})
-    await kv_set(f"cekgpv:{day}", json.dumps(cur))
-    await kv_set(f"cekupd:{day}", updated)
+    await kv_set(f"gpv:{provider}:{day}", json.dumps(cur))
+    await kv_set(f"gpvupd:{provider}:{day}", updated)
 
 
-async def get_cek_schedule(day: str) -> tuple[dict, str | None]:
-    return json.loads(await kv_get(f"cekgpv:{day}") or "{}"), await kv_get(f"cekupd:{day}")
+async def get_channel_schedule(provider: str, day: str) -> tuple[dict, str | None]:
+    return json.loads(await kv_get(f"gpv:{provider}:{day}") or "{}"), await kv_get(f"gpvupd:{provider}:{day}")
 
 
 # --- dedup / kv ---

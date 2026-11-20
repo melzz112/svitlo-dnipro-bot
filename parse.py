@@ -99,38 +99,72 @@ MONTHS = {
 INTERVAL_RE = re.compile(r"(\d{1,2}):(\d{2})\s*[—–-]\s*(\d{1,2}):(\d{2})")
 
 
-def _cek_date(t: str, today):
-    """«графік на 2026-11-19» / «на 20 листопада» / без дати -> сьогодні."""
-    from datetime import date
+def _post_date(t: str, today):
+    """«на завтра, 20.11.2026» / «графік на 2026-11-19» / «на 20 листопада» / «на завтра» / без дати -> сьогодні."""
+    from datetime import date, timedelta
 
+    if m := re.search(r"(?<!\d)(\d{2})\.(\d{2})\.(\d{4})(?!\d)", t):
+        return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
     if m := re.search(r"(\d{4})-(\d{2})-(\d{2})", t):
         return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
     if m := re.search(r"(\d{1,2})\s+(січ|лют|берез|квіт|трав|черв|лип|серп|верес|жовт|листопад|груд)\w*", t):
         month = MONTHS[m.group(2)]
         year = today.year + (1 if month < today.month - 6 else 0)  # графік на січень, а зараз грудень
         return date(year, month, int(m.group(1)))
+    if re.search(r"на завтра", t):
+        return today + timedelta(days=1)
     return today
 
 
-def parse_cek_schedule(raw: str, today) -> tuple | None:
-    """Пост з графіком ЦЕК -> (date, {"1.1": [(9.5, 13.0), ...]}). Груп може бути не всі (зміни)."""
+PROVIDER_RE = re.compile(r"цек|дтек|дтэк")
+
+
+def parse_schedule_posts(raw: str, today) -> list[tuple]:
+    """Пост із графіком ДТЕК і/або ЦЕК -> [(provider, date, {"1.1": [(9.5, 13.0), ...]}), ...].
+    Комбо-пости («СКАСОВАНО / Графік ДТЕК … / Графік для ЦЕК …») ріжемо на частини за назвою постачальника.
+    Груп може бути не всі (коригування / «зміни для ЦЕК») — тоді оновлюються лише перелічені."""
     t = strip_footer(raw).lower()
-    if "цек" not in t or not re.search(r"графік|зміни для", t):
-        return None
-    t = t[t.rfind("\n", 0, t.index("цек")) + 1:]  # у комбо-постах «ДТЕК + ЦЕК» беремо лише частину ЦЕК
-    groups: dict[str, list] = {}
-    cur = None
-    for line in t.splitlines():
-        if gs := find_groups(line):
-            cur = gs[0]
-            groups.setdefault(cur, [])
-        if cur:
-            for h1, m1, h2, m2 in INTERVAL_RE.findall(line):
-                groups[cur].append((int(h1) + int(m1) / 60, int(h2) + int(m2) / 60))
-    groups = {g: v for g, v in groups.items() if v or "графік" in t}
-    if len(groups) < 3:  # це не графік, а одне попередження
-        return None
-    return _cek_date(t, today), groups
+    if not re.search(r"графік|график|зміни для", t):
+        return []
+    # межі частин: кожна згадка постачальника; сусідні однакові зливаються
+    marks = [(m.start(), "cek" if m.group() == "цек" else "dtek") for m in PROVIDER_RE.finditer(t)]
+    parts: list[tuple[str, int, int]] = []
+    for i, (pos, prov) in enumerate(marks):
+        if parts and parts[-1][0] == prov:
+            continue
+        parts.append((prov, pos, len(t)))
+        if len(parts) > 1:
+            p, s, _ = parts[-2]
+            parts[-2] = (p, s, pos)
+    out = []
+    for prov, start, end in parts:
+        # початок частини — з початку її рядка (там буває «Графік … на 20.11.2026»)
+        seg = t[t.rfind("\n", 0, start) + 1:end]
+        tokens = sorted(
+            [(m.start(), "g", f"{m.group(1)}.{m.group(2)}") for m in GROUP_RE.finditer(seg)]
+            + [(m.start(), "i", m.groups()) for m in INTERVAL_RE.finditer(seg)]
+        )
+        groups: dict[str, list] = {}
+        cur = None
+        for _, kind, val in tokens:
+            if kind == "g":
+                cur = val
+                groups.setdefault(cur, [])
+            elif cur:
+                h1, m1, h2, m2 = map(int, val)
+                groups[cur].append((h1 + m1 / 60, h2 + m2 / 60))
+        n_intervals = sum(len(v) for v in groups.values())
+        if not re.search(r"графік|график", seg):
+            groups = {g: v for g, v in groups.items() if v}  # «зміни для» — лише групи з інтервалами
+        if len(groups) < 3 or n_intervals == 0:  # не графік, а попередження/зведення
+            continue
+        out.append((prov, _post_date(seg, today), groups))
+    return out
+
+
+def parse_cek_schedule(raw: str, today) -> tuple | None:
+    """Сумісність: лише частина ЦЕК."""
+    return next(((d, g) for p, d, g in parse_schedule_posts(raw, today) if p == "cek"), None)
 
 
 def _parse_cek(text: str, t: str) -> list[Alert]:
@@ -210,7 +244,7 @@ def _parse_channel(raw: str) -> list[Alert]:
         # «ЦЕК /ДТЭК аварійні, графіки не працюють» — обом; інакше — лише абонентам ЦЕК
         if re.search(r"дтек|дтэк", t) and re.search(r"аварій|екстрен|экстрен|не працюють|не работают", t):
             return [Alert("general", "*", None, _general(text).text, "*")]
-        if parse_cek_schedule(raw, __import__("datetime").date.today()):
+        if parse_cek_schedule(raw, __import__("datetime").date.today()) or t.startswith("⚡ цек — графік"):
             return []  # графік — зберігає userbot, пуш «графік оновився» шле notifier
         if t.startswith("⚠️ увага цек") or "готуємось до відключення" in t:
             return []  # нагадування за графіком — бот і сам нагадує

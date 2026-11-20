@@ -21,7 +21,7 @@ PICK_TEXT = (
     "🔢 потім свою <b>групу</b> відключень.\n\n"
     "Зараз: <b>{prov}</b>"
 )
-CEK_NOTE = "\n\nℹ️ ЦЕК не публікує графік у вигляді даних — бот бере його з Telegram-каналів, щойно він там з'являється."
+CHANNEL_NOTE = "\n\nℹ️ Графік {prov} бот бере з Telegram-каналів — щойно його там опублікують, він з'явиться тут і прийде пуш."
 ICON = {"on": "💡", "off": "🕯"}
 
 
@@ -99,8 +99,8 @@ async def sched(cb: CallbackQuery, callback_data: kb.Nav):
     text = f"🏢 {_pname(u)}\n" + day_text(u["grp"], slots, title)
     if label := await providers.update_label(_prov(u)):
         text += f"\n\n{label}"
-    if _prov(u) == "cek" and slots is None:
-        text += CEK_NOTE
+    if slots is None and (_prov(u) == "cek" or providers.dtek_source == "channel"):
+        text += CHANNEL_NOTE.format(prov=_pname(u))
     await edit(cb, text, kb.sched_kb(day))
 
 

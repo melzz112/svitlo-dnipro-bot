@@ -112,51 +112,66 @@ def demo_schedule() -> Schedule:
 
 
 _cache: tuple[float, Schedule] | None = None
-
+_site_fail_ts = 0.0
+SITE_RETRY_SEC = 30 * 60  # сайт ДТЕК за Incapsula: після відмови не стукаємо пів години
+dtek_source = "site"  # site | channel — звідки зараз графік ДТЕК (для підпису «Оновлено …»)
 
 FETCHERS = {"dtek": fetch_dtek, "yasno": fetch_yasno}
 
 
-async def cek_schedule() -> Schedule:
-    """ЦЕК не дає даних на сайті — графік збирає userbot з постів у Telegram-каналах (db.save_cek_schedule)."""
+async def channel_schedule(provider: str) -> Schedule:
+    """Графік, який userbot зібрав з постів у Telegram-каналах (db.save_channel_schedule)."""
     import db  # тут, щоб providers не тягнув БД при імпорті
 
     today = datetime.now(TZ).date()
     out: Schedule = {}
     for day, d in (("today", today), ("tomorrow", today + timedelta(days=1))):
-        groups, _ = await db.get_cek_schedule(d.isoformat())
+        groups, _ = await db.get_channel_schedule(provider, d.isoformat())
         out[day] = {g: [Slot(a, b) for a, b in v] for g, v in groups.items()}
     return out
 
 
-async def update_label(provider="dtek") -> str | None:
-    """Рядок «🕒 Оновлено …» для екрана графіка і пушів."""
-    if provider == "cek":
-        import db
-
-        _, upd = await db.get_cek_schedule(datetime.now(TZ).date().isoformat())
-        return f"🕒 Графік ЦЕК з Telegram-каналів, оновлено {upd}" if upd else None
-    return f"🕒 Оновлено ДТЕК: {last_update}" if last_update else None
-
-
-async def get_schedule(force=False, provider="dtek") -> Schedule:
-    """Кеш 5 хв; force (кнопка 🔄) — не частіше раз на хвилину, сторінка ДТЕК ~1 МБ."""
-    if provider == "cek":
-        return await cek_schedule()
-    global _cache
+async def _site_schedule(force=False) -> Schedule | None:
+    """Сайт ДТЕК: кеш 5 хв (🔄 — не частіше раз на хвилину). None, якщо недоступний."""
+    global _cache, _site_fail_ts
     if _cache:
         age = time.time() - _cache[0]
         if age < 60 or (not force and age < 300):
             return _cache[1]
-    if SOURCE == "demo":
-        sch = demo_schedule()
-    else:
-        try:
-            sch = await FETCHERS.get(SOURCE, fetch_dtek)()
-        except Exception as e:  # сайт змінився/лежить — не падаємо
-            log.warning("%s fetch failed: %r", SOURCE, e)
-            if _cache:
-                return _cache[1]
-            return {"today": {}, "tomorrow": {}}
+    if time.time() - _site_fail_ts < SITE_RETRY_SEC:
+        return None
+    try:
+        sch = await FETCHERS.get(SOURCE, fetch_dtek)()
+    except Exception as e:  # 403 від Incapsula, сайт лежить або змінився — беремо з каналів
+        log.warning("%s site unavailable, using Telegram channels: %r", SOURCE, e)
+        _site_fail_ts, _cache = time.time(), None
+        return None
+    if not (sch.get("today") or sch.get("tomorrow")):
+        return None
     _cache = (time.time(), sch)
     return sch
+
+
+async def update_label(provider="dtek") -> str | None:
+    """Рядок «🕒 Оновлено …» для екрана графіка і пушів."""
+    if provider == "dtek" and dtek_source == "site":
+        return f"🕒 Оновлено ДТЕК: {last_update}" if last_update else None
+    import db
+
+    _, upd = await db.get_channel_schedule(provider, datetime.now(TZ).date().isoformat())
+    name = "ЦЕК" if provider == "cek" else "ДТЕК"
+    return f"🕒 Графік {name} з Telegram-каналів, оновлено {upd}" if upd else None
+
+
+async def get_schedule(force=False, provider="dtek") -> Schedule:
+    """ЦЕК — лише з каналів. ДТЕК — з сайту, а якщо сайт недоступний — з каналів."""
+    global dtek_source
+    if provider == "cek":
+        return await channel_schedule("cek")
+    if SOURCE == "demo":
+        return demo_schedule()
+    if site := await _site_schedule(force):
+        dtek_source = "site"
+        return site
+    dtek_source = "channel"
+    return await channel_schedule("dtek")
