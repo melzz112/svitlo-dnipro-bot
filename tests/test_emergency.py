@@ -7,6 +7,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
+from datetime import datetime, timedelta
+
+from config import TZ
 
 import db
 import dtek_site
@@ -36,6 +39,12 @@ KYIV = (
     "обладнання та перевантаження мереж."
 )
 
+# Дати відносні: аварія почалась сьогодні і триває до завтра, тож тести не псуються, коли минає доба
+_NOW = datetime.now(TZ)
+D = f"{_NOW:%d.%m.%Y}"
+T = f"{_NOW + timedelta(days=1):%d.%m.%Y}"
+TS = T[:5]
+
 EMERGENCY = "Екстренні відключення (Аварійне без застосування графіку погодинних відключень)"
 
 
@@ -44,9 +53,9 @@ def house(sub="", start="", end="", grp="1.2"):
             "sub_type_reason": [f"GPV{grp}"], "voluntarily": None}
 
 
-def street_payload(off_12=3, end="17:16 20.11.2026"):
+def street_payload(off_12=3, end=f"17:16 {T}"):
     """4 будинки групи 1.2 (off_12 з них — екстрене) і 2 будинки 3.1 зі світлом."""
-    data = {str(n): house(EMERGENCY, "13:16 20.11.2026", end) if n <= off_12 else house() for n in range(1, 5)}
+    data = {str(n): house(EMERGENCY, f"13:16 {D}", end) if n <= off_12 else house() for n in range(1, 5)}
     data |= {"10": house(grp="3.1"), "12": house(grp="3.1")}
     return {"result": True, "data": data, "updateTimestamp": "13:48 20.11.2026"}
 
@@ -80,7 +89,7 @@ class SiteParseTests(unittest.TestCase):
         self.assertEqual(len(houses), 6)
         states = dtek_site.group_states(houses)
         self.assertEqual((states["1.2"].total, len(states["1.2"].off)), (4, 3))
-        self.assertEqual((states["1.2"].start, states["1.2"].end), ("13:16 20.11.2026", "17:16 20.11.2026"))
+        self.assertEqual((states["1.2"].start, states["1.2"].end), (f"13:16 {D}", f"17:16 {T}"))
         self.assertEqual((states["3.1"].total, states["3.1"].off), (2, []))
 
     def test_classify(self):
@@ -164,7 +173,7 @@ class SiteAlertTests(DbTestCase):
         self.assertEqual([uid for uid, _ in sent], [1])  # лише ДТЕК 1.2; ні 3.1, ні ЦЕК 1.2
         text = sent[0][1]
         self.assertIn("Екстрене відключення</b> · група <b>1.2", text)
-        self.assertIn("з 13:16, орієнтовно до <b>17:16 20.11", text)
+        self.assertIn(f"з 13:16, орієнтовно до <b>17:16 {TS}", text)
         self.assertIn("3 з 4", text)
         self.assertIn("сайт ДТЕК", text)
 
@@ -176,8 +185,8 @@ class SiteAlertTests(DbTestCase):
         self.assertNotIn("локальна аварія", now)
 
         self.assertEqual(await self.check(street_payload()), [])  # той самий стан — без повторів
-        self.assertEqual(await self.check(street_payload(end="17:30 20.11.2026")), [])  # +14 хв — дрібниця
-        sent = await self.check(street_payload(end="19:00 20.11.2026"))
+        self.assertEqual(await self.check(street_payload(end=f"17:30 {T}")), [])  # +14 хв — дрібниця
+        sent = await self.check(street_payload(end=f"19:00 {T}"))
         self.assertEqual(len(sent), 1)
         self.assertIn("продовжено", sent[0][1])
 
@@ -188,7 +197,7 @@ class SiteAlertTests(DbTestCase):
         self.assertNotIn("Світла немає", await self.verdict())
 
     async def test_one_house_of_many_is_not_a_group_outage(self):
-        data = {str(n): house() for n in range(1, 11)} | {"11": house(EMERGENCY, "13:16 20.11.2026", "17:16 20.11.2026")}
+        data = {str(n): house() for n in range(1, 11)} | {"11": house(EMERGENCY, f"13:16 {D}", f"17:16 {T}")}
         self.assertEqual(await self.check({"data": data}), [])
 
     async def test_people_saying_on_during_official_outage(self):
@@ -295,7 +304,7 @@ class ScheduleScreenTests(DbTestCase):
         await dtek_site.apply(dtek_site.Probe(dtek_site.parse_houses("вул. Микитинська", street_payload())))
         text = await self.open_sched("today")
         self.assertIn("🔴 Група <b>1.2</b> зараз без світла", text)
-        self.assertIn("з 13:16, орієнтовно до <b>17:16 20.11</b>", text)
+        self.assertIn(f"з 13:16, орієнтовно до <b>17:16 {TS}</b>", text)
         self.assertIn("3 з 4", text)
 
         tomorrow = await self.open_sched("tomorrow")
