@@ -296,10 +296,8 @@ class ScheduleScreenTests(DbTestCase):
         await db.set_emergency("dtek", {"since": int(time.time()), "text": DNIPRO_NOW, "source": "oua"})
         text = await self.open_sched("today")
         self.assertIn("Зараз діють екстрені відключення", text)
-        self.assertIn("Графік не діє", text)
-        self.assertNotIn("07:30", text)
-        self.assertNotIn("🟥", text)
-        self.assertNotIn("у «⚡ Зараз»", text)  # без зайвого «що з групою — у Зараз»
+        self.assertIn("07:30–10:00", text)  # графік показуємо і під час екстрених
+        self.assertIn("16:30–20:30", text)
 
         await dtek_site.apply(dtek_site.Probe(dtek_site.parse_houses("вул. Микитинська", street_payload())))
         text = await self.open_sched("today")
@@ -311,14 +309,14 @@ class ScheduleScreenTests(DbTestCase):
         self.assertIn("06:00–10:00", tomorrow)
         self.assertIn("якщо їх скасують", tomorrow)
 
-    async def test_group_emergency_alone_also_hides_schedule(self):
+    async def test_group_emergency_alone_keeps_schedule(self):
         await dtek_site.apply(dtek_site.Probe(dtek_site.parse_houses("вул. Микитинська", street_payload())))
         text = await self.open_sched("today")
         self.assertIn("Зараз діють екстрені", text)
-        self.assertNotIn("16:30", text)
+        self.assertIn("16:30–20:30", text)
         self.assertNotIn("16:30", await self.verdict())
 
-    async def test_today_schedule_updates_are_not_pushed_during_emergency(self):
+    async def test_today_schedule_updates_are_pushed_during_emergency(self):
         async def fetch(provider, *, today):
             return {"today": providers.DaySchedule({"3.1": [Slot(18, 20)]}, "dtek"),
                     "tomorrow": providers.DaySchedule({"3.1": [Slot(8, 10)]}, "dtek")}
@@ -328,8 +326,10 @@ class ScheduleScreenTests(DbTestCase):
         with patch.object(providers, "get_schedule_days", fetch), patch.object(notifier, "now_h", return_value=13.5):
             await notifier.tick(self.bot)
         texts = [t for uid, t in self.sent() if uid == 2]
-        self.assertEqual(len(texts), 1)
-        self.assertIn("на завтра", texts[0])
+        self.assertEqual(len(texts), 2)
+        self.assertIn("на сьогодні", texts[0])
+        self.assertIn("поза цим графіком", texts[0])
+        self.assertIn("на завтра", texts[1])
 
 
 class GetEmergencyTests(unittest.IsolatedAsyncioTestCase):

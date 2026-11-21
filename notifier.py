@@ -86,7 +86,7 @@ async def tick(bot: Bot):
                     continue
                 await db.kv_set(key, new)
                 await db.kv_set(src_key, schedule.source)
-                if not initialized or (day == "today" and emergency):  # сьогоднішній графік зараз не діє
+                if not initialized:
                     continue
                 title = "Сьогодні" if day == "today" else "Завтра"
                 if old is None:
@@ -96,6 +96,8 @@ async def tick(bot: Bot):
                 text = f"{head}\n\n{day_text(grp, slots, title)}"
                 if label := schedule.label():
                     text += f"\n\n{label}"
+                if day == "today" and emergency:
+                    text += "\n\n🚨 Зараз діють екстрені відключення — вони можуть бути поза цим графіком."
                 changes.setdefault(grp, []).append(text)
         if not initialized and any(schedule.groups for schedule in days.values()):
             await db.kv_set("sched_init", "1")
