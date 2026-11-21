@@ -16,9 +16,10 @@ from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 import db
 import dtek_site
 import keyboards as kb
+import stats
 from address import norm_house, parse_text_address, reverse_geocode
 from providers import get_schedule_days
-from config import TZ
+from config import ADMIN_IDS, TZ
 from render import day_text
 from status import emergency_today, house_block, verdict
 
@@ -55,6 +56,34 @@ async def edit(cb: CallbackQuery, text: str, markup):
         if "not modified" not in str(e):
             raise
     await cb.answer()
+
+
+def _is_admin(user) -> bool:
+    return bool(user) and user.id in ADMIN_IDS
+
+
+def _stats_kb():
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Оновити", callback_data="adm:stats")
+    return b.as_markup()
+
+
+@router.message(Command("stats"), F.from_user.id.in_(ADMIN_IDS))
+async def stats_cmd(m: Message):
+    """Лише для адміна. Усім іншим — тиша: команда ніби не існує (див. фільтр вище і handler нижче)."""
+    await m.answer(await stats.build(), reply_markup=_stats_kb())
+
+
+@router.callback_query(F.data == "adm:stats", F.from_user.id.in_(ADMIN_IDS))
+async def stats_refresh(cb: CallbackQuery):
+    await edit(cb, await stats.build(), _stats_kb())
+
+
+@router.message(Command("stats"))
+async def stats_denied(m: Message):
+    log.warning("/stats від чужого користувача %s", m.from_user.id if m.from_user else None)  # відповіді немає
 
 
 @router.message(CommandStart())

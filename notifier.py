@@ -1,5 +1,6 @@
 """Фонові сповіщення: перед відключенням, при зміні графіка, аварії з каналів, «люди пишуть»."""
 import asyncio
+import json
 import logging
 import time
 from datetime import datetime
@@ -46,10 +47,13 @@ def _matches(alert_provider: str, user: dict) -> bool:
 async def _send(bot: Bot, uid: int, text: str):
     try:
         await bot.send_message(uid, text, reply_markup=kb.main_menu())
+        await db.bump("push")
     except TelegramForbiddenError:
         await db.set_user(uid, notify_on=0)  # заблокував бота
+        await db.bump("blocked")
     except Exception as e:
         log.warning("send %s failed: %r", uid, e)
+        await db.bump("push_fail")
 
 
 async def tick(bot: Bot):
@@ -303,7 +307,9 @@ async def site_check(bot: Bot):
     except (httpx.HTTPError, ValueError) as e:
         _site_next = time.monotonic() + SITE_FAIL_SEC
         log.warning("сайт ДТЕК: перевірка адрес не вдалась: %r", e)
+        await db.kv_set("site_probe", json.dumps({"ok": False, "ts": int(time.time()), "err": str(e)[:80]}, ensure_ascii=False))
         return
+    await db.kv_set("site_probe", json.dumps({"ok": True, "ts": int(time.time()), "houses": len(probe.houses)}))
     providers.set_notice("dtek", probe.attention)  # заодно свіже вікно «Шановні клієнти!»
     for change in await dtek_site.apply(probe):
         log.info("сайт ДТЕК: %s", change)

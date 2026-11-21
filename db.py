@@ -35,6 +35,8 @@ MIGRATIONS = [
     ("reports", "provider", "'dtek'"),
     ("alerts", "provider", "'dtek'"),  # 'dtek' | 'cek' | '*'
     ("alerts", "src", "'channel'"),  # 'channel' — канали-агрегатори, 'dteksite' — перевірка адрес на сайті ДТЕК
+    ("users", "created", "0"),  # коли людина вперше написала боту (0 — до появи статистики)
+    ("users", "seen", "0"),  # остання активність (натиснула кнопку/написала)
     ("users", "street", "''"),  # адреса людини як на сайті ДТЕК («просп. Дмитра Яворницького») — для точних пушів
     ("users", "house", "''"),  # номер будинку як на сайті («14А»). Координати не зберігаємо.
 ]
@@ -49,7 +51,8 @@ async def init():
         await db.executescript(SCHEMA)
         for table, col, default in MIGRATIONS:
             try:
-                await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT DEFAULT {default}")
+                kind = "INTEGER" if default.isdigit() else "TEXT"
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind} DEFAULT {default}")
             except aiosqlite.OperationalError:
                 pass
         await db.commit()
@@ -78,8 +81,33 @@ async def get_user(uid):
     rows = await _all("SELECT * FROM users WHERE id=?", (uid,))
     if rows:
         return rows[0]
-    await _exec("INSERT INTO users(id) VALUES(?)", (uid,))
-    return {"id": uid, "grp": None, "notify_on": 1, "notify_min": 15, "provider": "dtek", "street": "", "house": ""}
+    now = int(time.time())
+    await _exec("INSERT INTO users(id, created, seen) VALUES(?,?,?)", (uid, now, now))
+    return {"id": uid, "grp": None, "notify_on": 1, "notify_min": 15, "provider": "dtek", "street": "", "house": "",
+            "created": now, "seen": now}
+
+
+_seen_cache: dict[int, float] = {}
+
+
+async def touch_user(uid: int):
+    """Остання активність людини; пишемо в БД не частіше раза на хвилину."""
+    now = time.time()
+    if now - _seen_cache.get(uid, 0) < 60:
+        return
+    _seen_cache[uid] = now
+    await get_user(uid)
+    await _exec("UPDATE users SET seen=? WHERE id=?", (int(now), uid))
+
+
+async def bump(name: str, n: int = 1):
+    """Лічильник за добу (для /stats): ключ stat:<name>:YYYY-MM-DD за київським часом."""
+    from datetime import datetime
+
+    from config import TZ
+
+    key = f"stat:{name}:{datetime.now(TZ):%Y-%m-%d}"
+    await kv_set(key, str(int(await kv_get(key) or 0) + n))
 
 
 async def set_user(uid, **fields):

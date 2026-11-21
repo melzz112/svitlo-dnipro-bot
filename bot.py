@@ -18,6 +18,18 @@ async def main():
     await db.init()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
+
+    @dp.update.outer_middleware()
+    async def track_activity(handler, event, data):
+        """Кожне оновлення від людини — відмітка «був активний» (для /stats)."""
+        if user := data.get("event_from_user"):
+            if not user.is_bot:
+                try:
+                    await db.touch_user(user.id)
+                except Exception:
+                    logging.getLogger(__name__).exception("touch_user failed")
+        return await handler(event, data)
+
     dp.include_router(router)
     await bot.set_my_commands([BotCommand(command="menu", description="Головне меню")])
     asyncio.create_task(notifier.loop(bot))
