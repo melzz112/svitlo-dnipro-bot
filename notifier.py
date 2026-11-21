@@ -108,8 +108,8 @@ async def tick(bot: Bot):
             for text in changes.get(u["grp"], []):
                 await _send(bot, u["id"], text)
                 await asyncio.sleep(0.05)
-            # 2) попередження перед відключенням (під час екстрених графік не діє — «через 15 хв вимкнуть» було б неправдою)
-            for s in [] if emergency else days["today"].groups.get(u["grp"], []):
+            # 2) попередження перед відключенням — шлемо і під час екстрених (так просять користувачі)
+            for s in days["today"].groups.get(u["grp"], []):
                 if s.kind != "off":
                     continue
                 left = (s.start - t) * 60

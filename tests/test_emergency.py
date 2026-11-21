@@ -255,7 +255,7 @@ class CityEmergencyTests(DbTestCase):
         self.assertIn("🔴 <b>Світла немає</b>", now)
         self.assertIn("екстрені відключення · люди підтверджують", now)
 
-    async def test_no_schedule_warnings_during_emergency(self):
+    async def test_schedule_warnings_still_sent_during_emergency(self):
         async def fetch(provider, *, today):
             return {"today": providers.DaySchedule({"1.2": [Slot(13.75, 16)]}, "dtek"), "tomorrow": providers.DaySchedule()}
 
@@ -264,7 +264,7 @@ class CityEmergencyTests(DbTestCase):
         with patch.object(providers, "get_schedule_days", fetch), patch.object(notifier, "now_h", return_value=13.5):
             await notifier.tick(self.bot)
         warned = [uid for uid, t in self.sent() if "Через 15 хв" in t]
-        self.assertEqual(warned, [3])  # ЦЕК 1.2 — у ЦЕК екстрених немає, графік діє; ДТЕК 1.2 — без «вимкнуть»
+        self.assertEqual(sorted(warned), [1, 3])  # і ДТЕК 1.2 (екстрені), і ЦЕК 1.2
 
     async def test_crowd_push_is_labelled_emergency(self):
         await db.set_emergency("dtek", {"since": int(time.time()), "text": "", "source": "oua"})
