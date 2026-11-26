@@ -292,6 +292,25 @@ _site_fails = 0
 MAX_USER_STREETS = 60  # скільки вулиць користувачів перевіряти за раз (решта — наступного разу)
 
 
+async def _finish_address(u: dict, street: str, h) -> str:
+    """Адреса чекала на сайт ДТЕК — сайт відповів: ставимо будинок і групу, повертаємо текст для людини."""
+    _, _, house = u["addr_q"].partition("|")
+    if h is None:
+        await db.set_user(u["id"], addr_q="")
+        return (f"🏠 Сайт ДТЕК відповів, але будинку <b>{escape(house)}</b> на вулиці <b>{escape(street)}</b> там немає.\n"
+                "Перевір номер (⚙️ Налаштування → 📍) — або твій будинок обслуговує ЦЕК, тоді обери групу вручну.")
+    if h.cek:
+        grp = dtek_site.cek_group(h)
+        await db.set_user(u["id"], addr_q="", provider="cek", street="", house="", **({"grp": grp} if grp else {}))
+        return (f"🏠 {escape(street)}, {escape(h.num)}\nЗа даними сайту ДТЕК твій будинок обслуговує <b>ЦЕК</b>"
+                + (f" · група <b>{grp}</b>. Поставив ЦЕК {grp}." if grp else ". Обери групу ЦЕК вручну (є в рахунку)."))
+    grp = h.groups[0] if h.groups else None
+    await db.set_user(u["id"], addr_q="", provider="dtek", street=street, house=h.num, **({"grp": grp} if grp else {}))
+    grp_line = f"🏢 ДТЕК · група <b>{grp}</b>" if grp else "🏢 ДТЕК · у цього будинку на сайті ДТЕК черги немає — стежу за самим будинком"
+    return (f"✅ <b>Знайшов твій будинок!</b>\n🏠 {escape(street)}, {escape(h.num)}\n{grp_line}\n\n"
+            "Тепер стежу за ним на сайті ДТЕК і напишу, щойно буде аварія, продовження чи світло повернеться.")
+
+
 async def site_check(bot: Bot):
     """Сайт ДТЕК, «Перевірити адресу» по контрольних вулицях (раз на DTEK_PROBE_SEC) -> екстрене по групах ->
     alerts, які send_alerts розсилає тут же. Так «по групі 1.2 вимкнули екстрено» доходить за хвилину."""
@@ -305,7 +324,11 @@ async def site_check(bot: Bot):
     if len(user_streets) > MAX_USER_STREETS:  # по колу, щоб усі вулиці перевірялись
         shift = int(time.time() // max(DTEK_PROBE_SEC, 1)) % len(user_streets)
         user_streets = (user_streets[shift:] + user_streets[:shift])[:MAX_USER_STREETS]
-    streets = list(dict.fromkeys(user_streets + list(dtek_site.DTEK_STREETS)))
+    # адреси, які люди вводили, поки сайт не пускав: їх вулиці — першими
+    pending = await db.users_addr_pending()
+    cands = {u["id"]: await dtek_site.street_candidates(u["addr_q"].partition("|")[0]) for u in pending}
+    pending_streets = [st for c in cands.values() for st in c]
+    streets = list(dict.fromkeys(pending_streets + user_streets + list(dtek_site.DTEK_STREETS)))
     try:
         probe = await dtek_site.probe(streets)
     except (httpx.HTTPError, ValueError) as e:
@@ -317,6 +340,9 @@ async def site_check(bot: Bot):
     _site_fails = 0
     await db.kv_set("site_probe", json.dumps({"ok": True, "ts": int(time.time()), "houses": len(probe.houses)}))
     providers.set_notice("dtek", probe.attention)  # заодно свіже вікно «Шановні клієнти!»
+    for u, street, h in dtek_site.resolve_pending(probe, pending, cands):
+        await _send(bot, u["id"], await _finish_address(u, street, h))
+        await asyncio.sleep(0.05)
     for change in await dtek_site.apply(probe):
         log.info("сайт ДТЕК: %s", change)
     for uid, text in await dtek_site.apply_users(probe, addr_users):

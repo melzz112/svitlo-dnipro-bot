@@ -155,7 +155,20 @@ class _Session:
 
     async def houses(self, street: str) -> list[House]:
         rr = await dtek_http.request(self.client, "POST", AJAX_URL, data=_form(street, self.update), headers=self.headers)
-        return parse_houses(street, rr.json())
+        houses = parse_houses(street, rr.json())
+        await _cache_houses(street, houses)
+        return houses
+
+
+async def _cache_houses(street: str, houses: list[House]):
+    """Кожна успішна відповідь сайту -> кеш «вулиця -> будинки з чергами»: адреса знаходиться й тоді,
+    коли сайт закрився антиботом."""
+    import db
+
+    try:
+        await db.save_houses(street, [(h.num, h.groups, h.cek) for h in houses])
+    except Exception as e:  # кеш — не привід зламати перевірку
+        log.warning("кеш будинків %s: %r", street, e)
 
 
 async def _remember_streets(streets: list[str]):
@@ -195,12 +208,41 @@ async def probe(streets: list[str] | None = None) -> Probe:
 
 # ---------- адреса користувача ----------
 
+async def street_candidates(street_query: str) -> list[str]:
+    """Назва від людини -> назви вулиць ДТЕК: з переліку сайту (збережений у БД), без нього — здогадки."""
+    import db
+    from address import guess_dtek_names, match_street
+
+    known = json.loads(await db.kv_get("dtek_streets") or "[]")
+    if known:
+        best = match_street(street_query, known)
+        return [best] if best else []
+    return guess_dtek_names(street_query)
+
 
 @dataclass
 class Lookup:
     street: str | None = None  # назва вулиці як на сайті ДТЕК; None — вулицю не знайшли
     house: House | None = None  # None — будинку немає в даних ДТЕК (можливо, ЦЕК)
     houses_on_street: int = 0
+
+
+async def lookup_cached(street_query: str, house: str) -> Lookup | None:
+    """Те саме, що lookup, але з кешу будинків (сайт недоступний). None — цієї вулиці в кеші немає.
+    Стан будинку (є/нема світла) з кешу не знаємо — його покаже наступна перевірка сайту."""
+    import db
+    from address import find_house
+
+    for name in await street_candidates(street_query):
+        rows = await db.cached_houses(name)
+        if not rows:
+            continue
+        found = find_house({r["num"]: r for r in rows}, house)
+        if not found:
+            return Lookup(name, None, len(rows))
+        num, r = found
+        return Lookup(name, House(name, num, r["groups"], None, cek=r["cek"]), len(rows))
+    return None
 
 
 async def lookup(street_query: str, house: str) -> Lookup:
@@ -249,6 +291,25 @@ def _house_off_text(street: str, num: str, h: House, head: str) -> str:
         lines.append(f"⏱ {since}орієнтовно до <b>{short_dt(h.end)}</b>")
     lines.append("<i>За даними сайту ДТЕК (перевірка адреси)</i>")
     return "\n".join(lines)
+
+
+def resolve_pending(probe_: Probe, pending: list[dict], cands: dict[int, list[str]]) -> list[tuple[dict, str, House | None]]:
+    """Адреси, що чекали на сайт: [(людина, вулиця ДТЕК, будинок або None — вулицю бачили, будинку нема)].
+    Ті, чиїх вулиць сайт цього разу не дав, — не в результаті (чекають далі)."""
+    from address import find_house
+
+    by_street: dict[str, dict[str, House]] = {}
+    for h in probe_.houses:
+        by_street.setdefault(h.street, {})[h.num] = h
+    out = []
+    for u in pending:
+        _, _, house = (u.get("addr_q") or "").partition("|")
+        seen = [st for st in cands.get(u["id"], []) if st in by_street]
+        if not seen:
+            continue
+        hit = next(((st, f[1]) for st in seen if (f := find_house(by_street[st], house))), None)
+        out.append((u, hit[0], hit[1]) if hit else (u, seen[0], None))
+    return out
 
 
 async def apply_users(probe_: Probe, users: list[dict]) -> list[tuple[int, str]]:

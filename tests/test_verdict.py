@@ -82,7 +82,7 @@ class DuringOutageTests(VerdictCase):
         await self.say("on", 12, "on", ago_min=7)
         text = await self.verdict(slot)
         self.assertIn("🟡 <b>Частково є світло</b>", text)
-        self.assertIn("за 30 хв:  💡 є — 12  ·  🕯 нема — 4", text)
+        self.assertIn("(за 30 хв: 💡 12 · 🕯 4)", text)
         self.assertNotIn("🟢", text)
 
 

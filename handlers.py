@@ -18,6 +18,7 @@ import dtek_site
 import keyboards as kb
 import stats
 from address import norm_house, parse_text_address, reverse_geocode
+from parse import clean_chat_text
 from providers import get_schedule_days
 from config import ADMIN_IDS, TZ
 from render import day_text
@@ -186,7 +187,7 @@ async def chats(cb: CallbackQuery):
     head = f"💬 <b>Що пишуть про {_pname(u)} {g}</b> <i>(не перевірено)</i>\n\n"
     c = (await db.chat_stats(provider=p)).get(g)
     if c:
-        head += f"За 30 хв: 💡 «є» — {c.get('on', 0)}, 🕯 «нема» — {c.get('off', 0)}\n\n"
+        head += f"За 30 хв пишуть (людей): 💡 «є» — {c.get('on', 0)}, 🕯 «нема» — {c.get('off', 0)}\n\n"
     msgs = await db.recent_chat_msgs(g, p)
     if not msgs:
         text = head + f"За останні 2 год про групу {g} ніхто не писав."
@@ -196,7 +197,7 @@ async def chats(cb: CallbackQuery):
             place = " · ".join(x for x in (r["district"] or "", f"вул. {r['street']}" if r.get("street") else "") if x)
             lines.append(
                 f"{ICON.get(r['event'], '❔')} {_ago(r['ts'])}{f' · <b>{escape(place)}</b>' if place else ''}\n"
-                f"<i>{escape(r['text'][:120])}</i>"
+                f"<i>{escape(clean_chat_text(r['text'])[:120])}</i>"
             )
         text = head + "\n".join(lines)
     await edit(cb, text[:4000], kb.simple_kb("chats"))
@@ -329,16 +330,28 @@ async def addr_house(m: Message, state: FSMContext):
 
 async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str):
     await m.answer("🔎 Шукаю будинок на сайті ДТЕК…")
+    cached = False
     try:
         res = await dtek_site.lookup(street_q, house)
     except (httpx.HTTPError, ValueError) as e:
         log.warning("ДТЕК lookup %r %r failed: %r", street_q, house, e)
-        await state.clear()
-        await m.answer("Сайт ДТЕК зараз не відповідає 😕 Спробуй за кілька хвилин (⚙️ Налаштування → 📍) "
-                       "або обери групу вручну.", reply_markup=ReplyKeyboardRemove())
-        u = await db.get_user(m.from_user.id)
-        await m.answer(PICK_TEXT.format(prov=_pname(u)), reply_markup=kb.groups_kb(u["grp"], _prov(u)))
-        return
+        # сайт закрився антиботом — беремо будинок з кешу (його наповнює кожна успішна перевірка сайту)
+        res = await dtek_site.lookup_cached(street_q, house)
+        cached = res is not None
+        if res is None:
+            cands = await dtek_site.street_candidates(street_q)
+            if cands:
+                await state.clear()
+                num = norm_house(house)
+                await db.set_user(m.from_user.id, addr_q=f"{street_q}|{num}")
+                await m.answer(
+                    f"⏳ Сайт ДТЕК зараз не пускає бота. Адресу <b>{escape(cands[0])}, {escape(num)}</b> я запам'ятав: "
+                    "щойно сайт відповість (зазвичай за кілька хвилин), сам знайду будинок, поставлю групу "
+                    "і напишу тобі.\n\nПоки що можеш обрати групу вручну 👇", reply_markup=ReplyKeyboardRemove())
+                u = await db.get_user(m.from_user.id)
+                await m.answer(PICK_TEXT.format(prov=_pname(u)), reply_markup=kb.groups_kb(u["grp"], _prov(u)))
+                return
+            res = dtek_site.Lookup()  # вулиці немає в переліку ДТЕК — нижче попросимо перевірити назву
     if not res.street:
         await m.answer(f"Не знайшов вулицю «{escape(street_q)}» у переліку ДТЕК. Перевір назву й напиши ще раз "
                        "(напр. <i>просп. Яворницького 3</i>). Якщо ти абонент ЦЕК — натисни «❌ Скасувати» "
@@ -346,6 +359,7 @@ async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str
         await state.set_state(Addr.waiting)
         return
     await state.clear()
+    await db.set_user(m.from_user.id, addr_q="")  # адресу знайшли — більше не чекаємо сайт
     if not res.house:
         await m.answer(
             f"Вулицю знайшов (<b>{escape(res.street)}</b>), але будинку <b>{escape(house)}</b> немає в даних ДТЕК.\n"
@@ -377,6 +391,18 @@ async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str
     if grp:
         fields["grp"] = grp
     await db.set_user(m.from_user.id, **fields)
+    if cached:  # з кешу — черга відома, а чи є зараз світло, покаже перша ж перевірка сайту (і напише, якщо нема)
+        await db.kv_set(f"house:{m.from_user.id}", "")
+        await db.kv_set(f"house_seen:{m.from_user.id}", "")
+        grp_line = f"🏢 ДТЕК · група <b>{grp}</b>" if grp else "🏢 ДТЕК · у цього будинку на сайті ДТЕК черги немає — стежу за самим будинком"
+        await m.answer(
+            f"✅ <b>Знайшов!</b>\n🏠 {escape(res.street)}, {escape(h.num)}\n{grp_line}\n"
+            "⏳ Сайт ДТЕК зараз не пускає бота — чи є світло в будинку, перевірю, щойно він відповість.\n\n"
+            "Далі я стежу за твоїм будинком на сайті ДТЕК і напишу, щойно буде аварія, продовження чи світло повернеться.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await m.answer(_menu_text(await db.get_user(m.from_user.id)), reply_markup=kb.main_menu())
+        return
     # одразу запам'ятовуємо поточний стан, щоб перша ж перевірка не дублювала те, що людина бачить зараз
     await db.kv_set(f"house_seen:{m.from_user.id}", json.dumps(
         {"kind": h.kind, "reason": dtek_site.reason(h) if h.kind else "", "start": h.start, "end": h.end,
@@ -389,7 +415,7 @@ async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str
         now_line = "🔴 Зараз: відключення за графіком"
     else:
         now_line = "✅ Зараз відключень немає"
-    grp_line = f"🏢 ДТЕК · група <b>{grp}</b>" if grp else "🏢 ДТЕК · групу сайт не вказав — обери її вручну в ⚙️"
+    grp_line = f"🏢 ДТЕК · група <b>{grp}</b>" if grp else "🏢 ДТЕК · у цього будинку на сайті ДТЕК черги немає — стежу за самим будинком"
     await m.answer(
         f"✅ <b>Знайшов!</b>\n🏠 {escape(res.street)}, {escape(h.num)}\n{grp_line}\n{now_line}\n\n"
         "Тепер я перевіряю твій будинок на сайті ДТЕК кожні кілька хвилин і напишу, щойно буде аварія, "

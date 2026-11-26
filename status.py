@@ -171,7 +171,8 @@ async def verdict(grp: str, provider: str) -> str:
 
     if alert or slot:
         # 1) офіційно зараз відключення — голоси з його початку (від кожної людини — останній)
-        people = await db.crowd_people(grp, provider, max(start, now.timestamp() - MAX_WINDOW))
+        since_ts = max(start, now.timestamp() - MAX_WINDOW)
+        people = await db.crowd_people(grp, provider, since_ts)
         n_on = sum(1 for ev, _ in people.values() if ev == "on")
         n_off = len(people) - n_on
         # свіжі голоси (30 хв) важать більше: «нема» о 3 ночі від людини, яка потім мовчить, не перекриває
@@ -188,7 +189,8 @@ async def verdict(grp: str, provider: str) -> str:
     else:
         # 2) офіційно відключення немає — «нема» рахуємо лише після офіційного кінця (раніші — про саме відключення)
         end_ts = await _recent_end(grp, provider, sch, now)
-        people = await db.crowd_people(grp, provider, end_ts or now.timestamp() - NO_OUTAGE_WINDOW)
+        since_ts = end_ts or now.timestamp() - NO_OUTAGE_WINDOW
+        people = await db.crowd_people(grp, provider, since_ts)
         n_on = sum(1 for ev, _ in people.values() if ev == "on")
         n_off = len(people) - n_on
         r_on, r_off = _recent_votes(people, now)
@@ -227,9 +229,11 @@ async def verdict(grp: str, provider: str) -> str:
     lines = [head, f"<i>{sub}</i>", ""]
     # 3) факти: люди / офіційно / графік
     if n_on or n_off:
-        lines.append(f"👥 Люди пишуть:  💡 є — {n_on}  ·  🕯 нема — {n_off}")
+        # один рядок: з якого часу рахуємо + скільки з них за 30 хв (від кожної людини — останнє)
+        line = f"👥 Люди з {_hm_ts(since_ts)}:  💡 є — {n_on}  ·  🕯 нема — {n_off}"
         if (r_on, r_off) != (n_on, n_off) and (r_on or r_off):
-            lines.append(f"     за 30 хв:  💡 є — {r_on}  ·  🕯 нема — {r_off}")
+            line += f"  <i>(за 30 хв: 💡 {r_on} · 🕯 {r_off})</i>"
+        lines.append(line)
     if note:
         lines.append(note)
     if share := await _group_share(grp, now, "🚨 Офіційно (сайт ДТЕК)") if provider == "dtek" else None:

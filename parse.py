@@ -42,6 +42,24 @@ def norm(text: str) -> str:
     return text.replace("’", "'").replace("`", "'").replace("ʼ", "'").replace("ё", "е").replace("\xa0", " ")
 
 
+# емодзі (з варіаційним селектором / ZWJ): «🛑», «‼️», «🔴»
+_EMOJI = r"(?:[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u203C\u2049\u2190-\u21FF\u25A0-\u25FF][\uFE0F\u200D]*)"
+EMOJI_RUN = re.compile(rf"({_EMOJI})(?:\s*{_EMOJI}){{2,}}")
+PUNCT_RUN = re.compile(r"([!?.)(])\1{3,}")
+
+
+def clean_chat_text(text: str) -> str:
+    """Спам у чатах: «🛑🛑🛑…🛑1.2 Анд …🛑🛑🛑», «‼️‼️‼️‼️ група 1.2 …», «!!!!!!!» -> один символ / «!!!»."""
+    t = EMOJI_RUN.sub(lambda m: m.group(1) + " ", text or "")
+    t = PUNCT_RUN.sub(lambda m: m.group(1) * 3, t)
+    return re.sub(r"[ \t]+", " ", t).strip()
+
+
+def chat_key(text: str) -> str:
+    """Ключ «те саме повідомлення»: без емодзі, розділових знаків, пробілів і регістру."""
+    return re.sub(r"\W+", "", norm(text).lower())[:200]
+
+
 def strip_footer(text: str) -> str:
     return FOOTERS.split(norm(text))[0].strip()
 

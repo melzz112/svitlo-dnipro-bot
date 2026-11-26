@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS alerts(
 );
 CREATE TABLE IF NOT EXISTS sent(key TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS dtek_houses(
+    street TEXT, num TEXT, groups TEXT, cek TEXT, ts INTEGER, PRIMARY KEY(street, num)
+);
 """
 
 # (таблиця, колонка, default) — додаються до існуючої БД
@@ -39,6 +42,7 @@ MIGRATIONS = [
     ("users", "seen", "0"),  # остання активність (натиснула кнопку/написала)
     ("users", "street", "''"),  # адреса людини як на сайті ДТЕК («просп. Дмитра Яворницького») — для точних пушів
     ("users", "house", "''"),  # номер будинку як на сайті («14А»). Координати не зберігаємо.
+    ("users", "addr_q", "''"),  # «вулиця|будинок», поки сайт ДТЕК не відповідав — знайдемо при першій успішній перевірці
 ]
 
 PROVIDERS = ("dtek", "cek")
@@ -125,6 +129,30 @@ async def users_with_address():
     return await _all("SELECT * FROM users WHERE street!='' AND house!='' AND provider='dtek'")
 
 
+async def users_addr_pending():
+    """Адреса чекає на сайт ДТЕК: [{"id", "addr_q": "березинська|45", ...}]."""
+    return await _all("SELECT * FROM users WHERE addr_q!=''")
+
+
+# --- кеш будинків з сайту ДТЕК: вулиця -> будинки з чергами (адреса працює, навіть коли сайт закрився антиботом) ---
+async def save_houses(street: str, houses: list[tuple[str, list[str], str]]):
+    """houses: [(номер, [черги], cek)]."""
+    if not houses:
+        return
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            "INSERT OR REPLACE INTO dtek_houses(street, num, groups, cek, ts) VALUES(?,?,?,?,?)",
+            [(street, num, ",".join(groups), cek or "", now) for num, groups, cek in houses],
+        )
+        await db.commit()
+
+
+async def cached_houses(street: str) -> list[dict]:
+    rows = await _all("SELECT num, groups, cek, ts FROM dtek_houses WHERE street=?", (street,))
+    return [{**r, "groups": [g for g in r["groups"].split(",") if g]} for r in rows]
+
+
 # --- звіти з кнопок бота ---
 async def add_report(uid, grp, status, provider="dtek"):
     await _exec("DELETE FROM reports WHERE user_id=?", (uid,))  # один актуальний звіт на людину
@@ -144,12 +172,25 @@ async def report_stats(grp, minutes=30, provider="dtek"):
 
 
 # --- повідомлення з чатів ---
-async def add_chat_msg(chat, text, district, event, groups=(), street=None, who="", provider=""):
-    """who — хеш автора (не сам ID): щоб рахувати різних людей, а не повідомлення."""
+REPEAT_SEC = 12 * 3600  # той самий текст від тієї ж людини за 12 год — спам, не новий звіт
+
+
+async def add_chat_msg(chat, text, district, event, groups=(), street=None, who="", provider="") -> bool:
+    """who — хеш автора (не сам ID): щоб рахувати різних людей, а не повідомлення.
+    Емодзі-флуд стискаємо; повтор того самого тексту від тієї ж людини не зберігаємо -> False."""
+    from parse import chat_key, clean_chat_text
+
+    text = clean_chat_text(text)
+    if who:
+        key = chat_key(text)
+        for r in await _all("SELECT text FROM chat_msgs WHERE who=? AND ts>=?", (who, int(time.time()) - REPEAT_SEC)):
+            if chat_key(r["text"]) == key:
+                return False
     await _exec(
         "INSERT INTO chat_msgs(chat, text, district, event, ts, grp, street, who, provider) VALUES(?,?,?,?,?,?,?,?,?)",
         (chat, text, district, event, int(time.time()), ",".join(groups), street or "", who, provider),
     )
+    return True
 
 
 async def crowd(minutes=15, provider="dtek"):
@@ -208,26 +249,44 @@ async def off_alerts(grp: str, provider: str, hours=12):
 
 
 async def chat_stats(minutes=30, provider="dtek"):
-    """{"1.1": {"off": 5, "on": 1}, ...} — повідомлення людей з чатів по групах."""
+    """{"1.1": {"off": 5, "on": 1}, ...} — скільки різних людей з чатів пишуть «є»/«нема» (від кожної — останнє)."""
     since = int(time.time()) - minutes * 60
-    out: dict[str, dict[str, int]] = {}
+    latest: dict[tuple[str, str], str] = {}
     for r in await _all(
-        f"SELECT grp, event FROM chat_msgs WHERE ts>=? AND grp!='' AND {_chat_provider_sql(provider)}", (since,)
+        f"SELECT grp, event, who, ts, text FROM chat_msgs WHERE ts>=? AND grp!='' AND {_chat_provider_sql(provider)} "
+        "ORDER BY ts", (since,)
     ):
+        who = r["who"] or f"m{r['ts']}{r['text'][:20]}"
         for g in r["grp"].split(","):
-            out.setdefault(g, {}).setdefault(r["event"], 0)
-            out[g][r["event"]] += 1
+            latest[(g, who)] = r["event"]
+    out: dict[str, dict[str, int]] = {}
+    for (g, _), ev in latest.items():
+        out.setdefault(g, {}).setdefault(ev, 0)
+        out[g][ev] += 1
     return out
 
 
 async def recent_chat_msgs(grp, provider="dtek", hours=2, limit=10):
-    """Лише повідомлення, де згадано саме цю групу, і лише свого постачальника."""
+    """Лише повідомлення, де згадано саме цю групу, і лише свого постачальника. Той самий текст від тієї ж
+    людини — один раз (найсвіжіший), навіть якщо вона вставила його 8 разів."""
+    from parse import chat_key
+
     since = int(time.time()) - hours * 3600
-    return await _all(
+    rows = await _all(
         f"SELECT * FROM chat_msgs WHERE ts>=? AND (','||grp||',') LIKE ? AND {_chat_provider_sql(provider)} "
         "ORDER BY ts DESC LIMIT ?",
-        (since, f"%,{grp},%", limit),
+        (since, f"%,{grp},%", limit * 10),
     )
+    out, seen = [], set()
+    for r in rows:
+        k = (r["who"], chat_key(r["text"])) if r["who"] else (r["ts"], r["text"])
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(r)
+        if len(out) >= limit:
+            break
+    return out
 
 
 # --- alerts з каналів ---

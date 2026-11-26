@@ -342,12 +342,27 @@ class DialogTests(DbCase):
         self.assertTrue(any("обслуговує <b>ЦЕК</b>" in t for t, _ in m.answers))
 
     async def test_site_down(self):
+        """Сайт закрився антиботом, будинку в кеші немає — адресу запам'ятовуємо і знайдемо при наступній перевірці."""
+        await db.kv_set("dtek_streets", json.dumps(["просп. Дмитра Яворницького"], ensure_ascii=False))
         await self.state.set_state(handlers.Addr.waiting)
         m = FakeMsg("Яворницького 3")
         with patch.object(dtek_site, "lookup", AsyncMock(side_effect=ValueError("антибот"))):
             await handlers.addr_text(m, self.state)
-        self.assertTrue(any("не відповідає" in t for t, _ in m.answers))
+        self.assertTrue(any("запам'ятав" in t and "просп. Дмитра Яворницького, 3" in t for t, _ in m.answers))
+        self.assertEqual((await db.get_user(1))["addr_q"], "Яворницького|3")
         self.assertIsNone(await self.state.get_state())
+
+    async def test_site_down_house_from_cache(self):
+        """Сайт закрився антиботом, але вулицю бот уже бачив — будинок і чергу беремо з кешу, а без черги — без неї."""
+        await db.kv_set("dtek_streets", json.dumps(["вул. Березинська"], ensure_ascii=False))
+        await db.save_houses("вул. Березинська", [("45", [], ""), ("43", ["2.1"], "")])
+        await self.state.set_state(handlers.Addr.waiting)
+        m = FakeMsg("березинська 45")
+        with patch.object(dtek_site, "lookup", AsyncMock(side_effect=ValueError("антибот"))):
+            await handlers.addr_text(m, self.state)
+        u = await db.get_user(1)
+        self.assertEqual((u["street"], u["house"], u["addr_q"]), ("вул. Березинська", "45", ""))
+        self.assertTrue(any("Знайшов" in t and "черги немає" in t for t, _ in m.answers))
 
     async def test_other_city(self):
         await self.state.set_state(handlers.Addr.waiting)

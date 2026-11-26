@@ -188,9 +188,11 @@ async def main():
         chat = getattr(event.chat, "title", "") or ""
         # автора НЕ зберігаємо — лише солоний хеш, щоб рахувати різних людей
         who = hashlib.sha256(f"{API_HASH}:{msg.from_id.user_id}".encode()).hexdigest()[:12]
-        await db.add_chat_msg(
+        if not await db.add_chat_msg(
             chat, event.raw_text, res["district"], res["event"], res["groups"], res["street"], who, res["provider"]
-        )
+        ):
+            log.info("USER повтор (не рахуємо) | %s", event.raw_text[:60])
+            return
         log.info("USER %s %s %s | %s", res["event"], res["groups"], res["street"] or "", event.raw_text[:60])
 
     if channels:
