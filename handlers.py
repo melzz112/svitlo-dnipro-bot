@@ -332,9 +332,13 @@ async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str
     await m.answer("🔎 Шукаю будинок на сайті ДТЕК…")
     cached = False
     try:
+        if await dtek_site.site_blocked():  # сайт щойно показав антибот — не додаємо йому запитів, одразу кеш
+            raise ValueError("сайт ДТЕК блокує бота — без запиту")
         res = await dtek_site.lookup(street_q, house)
     except (httpx.HTTPError, ValueError) as e:
         log.warning("ДТЕК lookup %r %r failed: %r", street_q, house, e)
+        if "без запиту" not in str(e):
+            await dtek_site.mark_blocked(str(e))
         # сайт закрився антиботом — беремо будинок з кешу (його наповнює кожна успішна перевірка сайту)
         res = await dtek_site.lookup_cached(street_q, house)
         cached = res is not None

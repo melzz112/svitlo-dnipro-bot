@@ -208,6 +208,23 @@ async def probe(streets: list[str] | None = None) -> Probe:
 
 # ---------- адреса користувача ----------
 
+BLOCK_SEC = 15 * 60  # сайт показав антибот — 15 хв не смикаємо його запитами людей (адреса -> кеш / «чекає»)
+
+
+async def site_blocked() -> bool:
+    """Остання спроба (перевірка адрес чи пошук адреси людини) за 15 хв натрапила на антибот / 403."""
+    import db
+
+    s = json.loads(await db.kv_get("site_probe") or "null")
+    return bool(s) and not s.get("ok") and time.time() - s.get("ts", 0) < BLOCK_SEC
+
+
+async def mark_blocked(err: str):
+    import db
+
+    await db.kv_set("site_probe", json.dumps({"ok": False, "ts": int(time.time()), "err": err[:80]}, ensure_ascii=False))
+
+
 async def street_candidates(street_query: str) -> list[str]:
     """Назва від людини -> назви вулиць ДТЕК: з переліку сайту (збережений у БД), без нього — здогадки."""
     import db

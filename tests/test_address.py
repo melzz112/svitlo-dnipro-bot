@@ -352,6 +352,17 @@ class DialogTests(DbCase):
         self.assertEqual((await db.get_user(1))["addr_q"], "Яворницького|3")
         self.assertIsNone(await self.state.get_state())
 
+    async def test_blocked_site_not_asked_again(self):
+        """Перша спроба натрапила на антибот — наступні 15 хв адреса йде одразу в кеш / «чекає», без запиту до сайту."""
+        await db.kv_set("dtek_streets", json.dumps(["просп. Дмитра Яворницького"], ensure_ascii=False))
+        with patch.object(dtek_site, "lookup", AsyncMock(side_effect=ValueError("антибот"))) as lk:
+            for text in ("Яворницького 3", "Яворницького 5"):
+                await self.state.set_state(handlers.Addr.waiting)
+                await handlers.addr_text(FakeMsg(text), self.state)
+        self.assertEqual(lk.await_count, 1)
+        self.assertTrue(await dtek_site.site_blocked())
+        self.assertEqual((await db.get_user(1))["addr_q"], "Яворницького|5")
+
     async def test_site_down_house_from_cache(self):
         """Сайт закрився антиботом, але вулицю бот уже бачив — будинок і чергу беремо з кешу, а без черги — без неї."""
         await db.kv_set("dtek_streets", json.dumps(["вул. Березинська"], ensure_ascii=False))

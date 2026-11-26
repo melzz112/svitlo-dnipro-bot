@@ -289,7 +289,7 @@ SITE_FAIL_SEC = 15 * 60  # сайт закрився антиботом — пр
 _site_next = 0.0
 _site_warned = 0.0
 _site_fails = 0
-MAX_USER_STREETS = 60  # скільки вулиць користувачів перевіряти за раз (решта — наступного разу)
+MAX_USER_STREETS = 30  # скільки вулиць користувачів перевіряти за раз (решта — наступного разу, по колу)
 
 
 async def _finish_address(u: dict, street: str, h) -> str:
