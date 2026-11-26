@@ -92,6 +92,18 @@ ON_PARTIAL_MIN = 5  # стільки різних людей «дали», що�
 OFF_LOCAL_MIN = 3  # стільки «нема» після офіційного кінця, щоб сказати «світла немає» (локальна аварія / затримка)
 
 
+RECENT_SEC = 30 * 60
+FAST_SEC = 5 * 60  # «за 5 хв ≥5 людей пишуть одне й те саме» — перемикаємо вердикт, хоч би що казав офіційний час
+FAST_MIN = 5
+
+
+def _recent_votes(people: dict, now: datetime) -> tuple[int, int]:
+    """(«є», «нема») серед тих, хто писав за останні 30 хв (від кожної людини — останній голос)."""
+    since = now.timestamp() - RECENT_SEC
+    recent = [ev for ev, ts in people.values() if ts >= since]
+    return recent.count("on"), len(recent) - recent.count("on")
+
+
 def _hm_ts(ts: float) -> str:
     return datetime.fromtimestamp(ts, TZ).strftime("%H:%M")
 
@@ -156,10 +168,13 @@ async def verdict(grp: str, provider: str) -> str:
         people = await db.crowd_people(grp, provider, max(start, now.timestamp() - MAX_WINDOW))
         n_on = sum(1 for ev, _ in people.values() if ev == "on")
         n_off = len(people) - n_on
+        # свіжі голоси (30 хв) важать більше: «нема» о 3 ночі від людини, яка потім мовчить, не перекриває
+        # хвилю «дали» зараз
+        r_on, r_off = _recent_votes(people, now)
         till = f" до <b>{until}</b>" if until else ""
-        if n_on >= ON_PARTIAL_MIN and n_on >= 2 * n_off:
-            head, sub = "🟡 <b>Частково є світло</b>", "почали вмикати, але не всім"
-        elif n_on >= 1 and n_on >= n_off:
+        if (n_on >= ON_PARTIAL_MIN and n_on >= 2 * n_off) or (r_on >= ON_PARTIAL_MIN and r_on >= 2 * r_off):
+            head, sub = "🟡 <b>Частково є світло</b>", "люди масово пишуть «дали» — почали вмикати, але не всім"
+        elif (n_on >= 1 and n_on >= n_off) or (r_on >= 2 and r_on > r_off):
             head, sub = "🔴 <b>Світла немає</b>", "дехто пише, що дали — можливо, почали вмикати"
         else:
             reason = _label(alert["text"]) if alert else "за графіком"
@@ -170,6 +185,7 @@ async def verdict(grp: str, provider: str) -> str:
         people = await db.crowd_people(grp, provider, end_ts or now.timestamp() - NO_OUTAGE_WINDOW)
         n_on = sum(1 for ev, _ in people.values() if ev == "on")
         n_off = len(people) - n_on
+        r_on, r_off = _recent_votes(people, now)
         till = ""
         if city_em and n_off >= 2 and n_off > n_on:  # під час екстрених «нема» майже напевно правда
             head, sub = "🔴 <b>Світла немає</b>", "екстрені відключення · люди підтверджують"
@@ -188,10 +204,26 @@ async def verdict(grp: str, provider: str) -> str:
         if n_off and not head.startswith("🔴"):
             note = f"⚠️ Не всі зі світлом — {n_off} {'пише' if n_off == 1 else 'пишуть'}, що досі нема"
 
+    # 3) хвиля за 5 хв перекриває офіційний час: ≥5 людей і вдвічі більше, ніж протилежних
+    fast = await db.crowd_people(grp, provider, now.timestamp() - FAST_SEC)
+    f_on = sum(1 for ev, _ in fast.values() if ev == "on")
+    f_off = len(fast) - f_on
+    official = bool(alert or slot)
+    if f_on >= FAST_MIN and f_on >= 2 * f_off and not head.startswith("🟢"):
+        head = "🟡 <b>Є світло, але не в усіх</b>"
+        sub = f"за 5 хв {f_on} людей пишуть «дали»" + (f" · офіційно — відключення{till}" if official else "")
+        note = None
+    elif f_off >= FAST_MIN and f_off >= 2 * f_on and not head.startswith("🔴"):
+        head = "🟠 <b>Світла немає, але не в усіх</b>"
+        sub = f"за 5 хв {f_off} людей пишуть «нема»" + ("" if official else " · офіційно відключення немає")
+        note = None
+
     lines = [head, f"<i>{sub}</i>", ""]
     # 3) факти: люди / офіційно / графік
     if n_on or n_off:
         lines.append(f"👥 Люди пишуть:  💡 є — {n_on}  ·  🕯 нема — {n_off}")
+        if (r_on, r_off) != (n_on, n_off) and (r_on or r_off):
+            lines.append(f"     за 30 хв:  💡 є — {r_on}  ·  🕯 нема — {r_off}")
     if note:
         lines.append(note)
     if alert:

@@ -209,11 +209,11 @@ class SiteAlertTests(DbTestCase):
         self.assertNotIn("🟢", text)
         self.assertIn("🔴 <b>Світла немає</b>", text)
         self.assertIn("дехто пише, що дали", text)
-        for who in "de":  # п'ятеро — «частково», але все одно не «є»
+        for who in "de":  # п'ятеро за 5 хв — перемикаємо на «дали», офіційний час — нижче
             await db.add_chat_msg("chat", "1.2 дали", None, "on", ["1.2"], who=who)
         text = await self.verdict()
-        self.assertIn("🟡 <b>Частково є світло</b>", text)
-        self.assertNotIn("🟢", text)
+        self.assertIn("🟡 <b>Є світло, але не в усіх</b>", text)
+        self.assertIn("Офіційно:", text)
 
 
 class CityEmergencyTests(DbTestCase):

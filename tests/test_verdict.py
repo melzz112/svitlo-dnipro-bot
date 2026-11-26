@@ -67,12 +67,49 @@ class DuringOutageTests(VerdictCase):
         self.assertIn("дехто пише, що дали — можливо, почали вмикати", text)
 
     async def test_many_on_is_partial_not_green(self):
-        await self.say("on", 6, "on")
-        await self.say("off", 2, "off")
+        await self.say("on", 6, "on", ago_min=10)  # за 30 хв, але не за 5 — «частково»
+        await self.say("off", 2, "off", ago_min=10)
         text = await self.verdict(self.slot())
         self.assertIn("🟡 <b>Частково є світло</b>", text)
         self.assertNotIn("🟢", text)
         self.assertIn("📅 Графік: відключення до", text)
+
+    async def test_fresh_wave_of_on_beats_old_off(self):
+        """Скрін 11:24: «нема» з ночі + свіжа хвиля «дали» -> не «Світла немає», а «частково»."""
+        slot = [Slot(self.t - 3, self.t + 2)]
+        await self.say("off", 12, "night", ago_min=150)  # написали на початку відключення і мовчать
+        await self.say("off", 4, "off", ago_min=10)
+        await self.say("on", 12, "on", ago_min=7)
+        text = await self.verdict(slot)
+        self.assertIn("🟡 <b>Частково є світло</b>", text)
+        self.assertIn("за 30 хв:  💡 є — 12  ·  🕯 нема — 4", text)
+        self.assertNotIn("🟢", text)
+
+
+class FastSwitchTests(VerdictCase):
+    """≥5 людей за 5 хв пишуть одне й те саме — вердикт перемикається, хоч би що казав офіційний час."""
+
+    async def test_five_on_in_five_minutes_is_green_during_outage(self):
+        slot = [Slot(self.t - 1, self.t + 2)]
+        await self.say("off", 3, "off", ago_min=30)
+        await self.say("on", 4, "on", ago_min=2)
+        self.assertNotIn("не в усіх", await self.verdict(slot))  # 4 — ще ні
+        await self.say("on", 1, "late")
+        text = await self.verdict(slot)
+        self.assertIn("🟡 <b>Є світло, але не в усіх</b>", text)
+        self.assertIn("за 5 хв 5 людей пишуть «дали»", text)
+        self.assertIn("офіційно — відключення до", text)
+
+    async def test_old_on_does_not_count(self):
+        await self.say("on", 6, "on", ago_min=8)  # 8 хв тому — поза вікном 5 хв
+        self.assertNotIn("не в усіх", await self.verdict([Slot(self.t - 1, self.t + 2)]))
+
+    async def test_five_off_in_five_minutes_is_red_without_outage(self):
+        await self.say("off", 5, "off", ago_min=1)
+        await self.say("on", 2, "on", ago_min=1)
+        text = await self.verdict([])
+        self.assertIn("🔴 <b>Світла немає</b>", text)
+        self.assertIn("нема — 5", text)
 
 
 class AfterOutageTests(VerdictCase):

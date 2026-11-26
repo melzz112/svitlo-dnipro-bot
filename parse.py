@@ -331,6 +331,8 @@ OFF_PHRASES = [
     "пропал свет", "пропало світло", "пропало", "пропал", "зникло світло", "зникло", "погасло", "погас",
     "тьма", "темно", "минус свет", "мінус світло", "знову вимкнули", "опять вырубили", "опять отключили",
     "сидимо без", "сидим без", "у меня нет", "у меня нету", "у нас нет", "у нас нету", "у мене нема", "у нас нема",
+    "офф", "до сих пор нет", "нет до сих пор", "досі нема", "досі немає", "опять нет", "снова нет", "знову нема",
+    "знову немає", "и нету", "і нема",
 ]
 ON_PHRASES = [
     "є світло", "есть свет", "свет есть", "світло є", "дали світло", "дали свет", "дали", "включили",
@@ -339,13 +341,40 @@ ON_PHRASES = [
     "повернули світло", "повернули", "вернули свет", "вернули",
 ]
 # «бан дали», «дали график» — «дали» не про світло
-DALI_OTHER = re.compile(r"(бан|графік|график|пизд\w*|денег|гроші|номер)\s+дали|дали\s+(бан|графік|график|пизд\w*|денег|гроші)")
+DALI_OTHER = re.compile(
+    r"(бан|графік|график|пизд\w*|денег|гроші|номер|ответ|відповідь|інфо\w*|инфо\w*)\s+дали|"
+    r"дали\s+(бан|графік|график|пизд\w*|денег|гроші|ответ|відповідь|номер|(?:в|у)\s+(?:дтек|дтэк|цек))"
+)
 QUESTION = re.compile(
     r"\?|(?<!\w)(коли|когда|где|де|кому|у кого|у когось|хтось|кто-?нибудь|кто-?то|підкаж\w*|подскаж\w*|"
-    r"не знаете|не знаєте)(?![\w-])"
+    r"не знаете|не знаєте|кому-?нибудь|кому-?небудь)(?![\w-])|(?:комусь|кумусь|кому-?то)\s+дали"
 )
 # узагальнення/скарги: «мы всегда без света», «Днепр всегда без света» — не звіт про «зараз»
-GENERAL = re.compile(r"(?<!\w)(всегда|завжди|вечно|постоянно|постійно|как обычно|як завжди|почти всегда)(?!\w)")
+GENERAL = re.compile(
+    r"(?<!\w)(всегда|завжди|вечно|вечн\w+|постоянно|постійно|как обычно|як завжди|почти всегда|круглосуточно|цілодобово)(?!\w)"
+)
+# «дали на 5 минут», «включили на полчаса» — уже, найімовірніше, знову вимкнули; без явного «вимкнули» — не звіт
+SHORT_ON = re.compile(
+    r"(?:дали|включили|увімкнули|ввімкнули)\s+(?:\w+\s+)?на\s+(?:\d+[.,]?\d*\s*(?:мин|хв|сек)|минут|хвилин|"
+    r"пару|полчаса|пів\s?години|півгодини|секунд)"
+)
+# «дали с 5 до 5:40», «свет был 4 часа», «спустя сутки дали на полтора часа» — про минуле, не про «зараз»
+PAST_ON = re.compile(
+    r"(?:дали|включили|давали)\s+(?:\w+\s+){0,2}(?:с|з)\s*\d{1,2}(?:[:.]\d{2})?\s*(?:до|по)\s*\d{1,2}|"
+    r"(?:с|з)\s*\d{1,2}(?:[:.]\d{2})?\s*(?:до|по)\s*\d{1,2}(?:[:.]\d{2})?\s+(?:дали|давали|был)|(?<!\w)(?:был|была|было|були|був|було|була)\s+(?:свет|світло)|"
+    r"(?:свет|світло)\s+(?:был|було|був)(?!\w)|(?<!\w)(?:позавчера|позавчора|вчера|вчора)(?!\w)"
+)
+# «не у всех свет есть», «дома напротив есть свет» — про інших
+OTHERS_ON = re.compile(
+    r"не у всех|не у всіх|не всім|не всем|у соседей|у сусідів|напротив|навпроти|рядом|поруч|сусідн|соседн|у других|"
+    r"в других|в інших|у інших|вам уже|вам дали|им дали|їм дали|у них"
+)
+# «дали … и через 10 мин офф» — останній стан важливіший
+SEQ = re.compile(r"(?<!\w)(?:и|і|й|потом|потім|через|опять|снова|знову|а потом|а потім|уже|вже)(?!\w)")
+# «не знаю как у 3.2, но у 5.1 выключили», «5.1 нет света, зато 5.2 …» — групу з такої частини не беремо
+CONTRAST_SPLIT = re.compile(r"[,;.!]*\s+(?:но|але|а|зато|проте|однак|тоді як|в отличие от)\s+|[;!]+|\.\s")
+UNKNOWN = re.compile(r"не знаю|не в курсе|не в курсі|хз|без понятия|хто зна|кто знает")
+ELSEWHERE = re.compile(r"элитн|еліт|других|інших|чужих|у них|им(?!\w)|їм(?!\w)")
 SIGN_OFF = re.compile(r"(?:^|\s)[-−–]\s*(?:свет|світло|св)(?!\w)|^\s*[-−–]{1,3}\s*$")
 SIGN_ON = re.compile(r"(?:^|\s)\+\s*(?:свет|світло|св)(?!\w)|^\s*\+{1,3}\s*$")
 BARE_SIGN = re.compile(r"^\s*([+\-−–]{1,3})\s*[!)]*\s*$")  # «+», «++», «-» без групи — це реакція на чуже
@@ -386,6 +415,54 @@ def _has(t: str, phrases: list[str]) -> bool:
     return any(re.search(r"(?<!\w)" + re.escape(p) + r"(?!\w)", t) for p in phrases)
 
 
+def _spans(t: str, phrases: list[str]) -> list[tuple[int, int]]:
+    out = []
+    for p in phrases:
+        out += [m.span() for m in re.finditer(r"(?<!\w)" + re.escape(p) + r"(?!\w)", t)]
+    return out
+
+
+def _last_state(t: str, t_on: str) -> str | None:
+    """«дали … и через 10 мин офф» -> off; «вирубили, а потім дали» -> on. Лише якщо між ними є «і/потім/через…»
+    і мова не про інших («у нас нема, а сусідам дали» — не розбираємо)."""
+    on, off = _spans(t_on, ON_PHRASES), _spans(t, OFF_PHRASES)
+    if not on or not off or OTHERS_ON.search(t):
+        return None
+    last_on, last_off = max(e for _, e in on), max(e for _, e in off)
+    first_on, first_off = min(s for s, _ in on), min(s for s, _ in off)
+    if last_off > last_on and first_on < first_off and SEQ.search(t[first_on:max(s for s, _ in off)]):
+        return "off"
+    if last_on > last_off and first_off < first_on and SEQ.search(t[first_off:max(s for s, _ in on)]):
+        return "on"
+    return None
+
+
+def _clause_event(c: str) -> str | None:
+    on, off = _has(DALI_OTHER.sub(" ", c), ON_PHRASES), _has(c, OFF_PHRASES)
+    if on and NEGATED_ON.search(c):
+        on, off = False, True
+    return None if on == off else "on" if on else "off"
+
+
+def _groups_for(t: str, groups: list[str], event: str) -> list[str]:
+    """Кілька груп у повідомленні — лишаємо ті, про які саме цей стан: «не знаю як у 3.2, але в 5.1 вимкнули»
+    -> 5.1; «5.1 нет света, зато 5.2 графики» -> 5.1."""
+    if len(groups) < 2 and not UNKNOWN.search(t):
+        return groups
+    clauses = CONTRAST_SPLIT.split(t)
+    if len(clauses) < 2:
+        return groups
+    keep = set()
+    for i, c in enumerate(clauses):
+        cg = _user_groups(c)
+        if not cg:
+            continue
+        ev = _clause_event(c)
+        if ev == event or (ev is None and i == 0 and not UNKNOWN.search(c) and not ELSEWHERE.search(c)):
+            keep.update(cg)
+    return sorted(keep)
+
+
 def _user_groups(t: str) -> list[str]:
     found = set(find_groups(t, user=True)) | {f"{a}.{b}" for a, b in DASH_GROUP_RE.findall(t)}
     return sorted(g for g in found if g in GROUPS)
@@ -418,8 +495,19 @@ def _parse_one(raw: str) -> dict | None:
     on = _has(t_on, ON_PHRASES) or bool(SIGN_ON.search(rest))
     if on and NEGATED_ON.search(t):  # «не дали», «ще не включили» -> це «нема»
         on, off = False, True
+    if on and off:
+        state = _last_state(t, t_on)
+        if not state:
+            return None
+        on, off = state == "on", state == "off"
     if on == off:
         return None
+    if on and (SHORT_ON.search(t) or PAST_ON.search(t) or OTHERS_ON.search(t) or GENERAL.search(t)):
+        return None
+    if groups:
+        groups = _groups_for(t, groups, "on" if on else "off")
+        if not groups and not _has(t, ["у меня", "у мене", "у нас", "в нас"]):
+            return None
     provider = "cek" if "цек" in t else "dtek" if re.search(r"дтек|дтэк", t) else ""
     return {
         "event": "on" if on else "off", "groups": groups, "district": find_district(t),

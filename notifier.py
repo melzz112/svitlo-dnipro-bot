@@ -287,13 +287,14 @@ async def emergency_check(bot: Bot):
 SITE_FAIL_SEC = 15 * 60  # сайт закрився антиботом — пробуємо знову за 15 хв, не смикаємо його
 _site_next = 0.0
 _site_warned = 0.0
+_site_fails = 0
 MAX_USER_STREETS = 60  # скільки вулиць користувачів перевіряти за раз (решта — наступного разу)
 
 
 async def site_check(bot: Bot):
     """Сайт ДТЕК, «Перевірити адресу» по контрольних вулицях (раз на DTEK_PROBE_SEC) -> екстрене по групах ->
     alerts, які send_alerts розсилає тут же. Так «по групі 1.2 вимкнули екстрено» доходить за хвилину."""
-    global _site_next, _site_warned
+    global _site_next, _site_warned, _site_fails
     if not DTEK_PROBE_SEC or SOURCE != "dtek" or CITY != "dnipro" or time.monotonic() < _site_next:
         return
     _site_next = time.monotonic() + DTEK_PROBE_SEC
@@ -307,10 +308,12 @@ async def site_check(bot: Bot):
     try:
         probe = await dtek_site.probe(streets)
     except (httpx.HTTPError, ValueError) as e:
-        _site_next = time.monotonic() + SITE_FAIL_SEC
+        _site_fails += 1  # 15 хв, 30, 60 — і далі раз на годину, поки сайт не оживе
+        _site_next = time.monotonic() + min(SITE_FAIL_SEC * 2 ** (_site_fails - 1), 3600)
         log.warning("сайт ДТЕК: перевірка адрес не вдалась: %r", e)
         await db.kv_set("site_probe", json.dumps({"ok": False, "ts": int(time.time()), "err": str(e)[:80]}, ensure_ascii=False))
         return
+    _site_fails = 0
     await db.kv_set("site_probe", json.dumps({"ok": True, "ts": int(time.time()), "houses": len(probe.houses)}))
     providers.set_notice("dtek", probe.attention)  # заодно свіже вікно «Шановні клієнти!»
     for change in await dtek_site.apply(probe):

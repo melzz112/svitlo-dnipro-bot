@@ -16,8 +16,11 @@ import sys
 import time
 from dataclasses import dataclass, field
 
+import random
+
 import httpx
 
+import dtek_http
 from config import DTEK_STREETS, GROUPS
 
 log = logging.getLogger(__name__)
@@ -129,12 +132,12 @@ class _Session:
     async def __aenter__(self):
         from providers import extract_attention
 
-        self.client = httpx.AsyncClient(timeout=10, follow_redirects=True)
+        self.client = dtek_http.client()
         try:
-            r = await self.client.get(PAGE_URL)
-            r.raise_for_status()
+            r = await dtek_http.request(self.client, "GET", PAGE_URL)
             token = re.search(r'<meta[^>]+name="csrf-token"[^>]+content="([^"]+)"', r.text)
             if not token or "DisconSchedule" not in r.text:
+                dtek_http.reset()
                 raise ValueError("сторінка ДТЕК без csrf/DisconSchedule — схоже, антибот")
         except BaseException:
             await self.client.aclose()
@@ -147,11 +150,11 @@ class _Session:
         return self
 
     async def __aexit__(self, *exc):
+        dtek_http.keep(self.client)
         await self.client.aclose()
 
     async def houses(self, street: str) -> list[House]:
-        rr = await self.client.post(AJAX_URL, data=_form(street, self.update), headers=self.headers)
-        rr.raise_for_status()
+        rr = await dtek_http.request(self.client, "POST", AJAX_URL, data=_form(street, self.update), headers=self.headers)
         return parse_houses(street, rr.json())
 
 
@@ -166,18 +169,24 @@ async def probe(streets: list[str] | None = None) -> Probe:
     """Сторінка (кукі + csrf) -> по запиту на кожну вулицю. Сайт закрився антиботом — ValueError/HTTPError."""
     streets = streets or DTEK_STREETS
     out = Probe()
+    errors = 0
     async with _Session() as s:
         out.attention, out.streets = s.attention, s.streets
-        for street in streets:
+        for i, street in enumerate(streets):
             try:
                 houses = await s.houses(street)
+                errors = 0
             except (httpx.HTTPError, ValueError) as e:
                 log.warning("ДТЕК: вулиця %s — %r", street, e)
                 houses = []
+                errors += 1
+                if errors >= 3:  # сайт почав відмовляти — не добиваємо його рештою вулиць
+                    out.failed += streets[i:]
+                    break
             if not houses:
                 out.failed.append(street)
             out.houses += houses
-            await asyncio.sleep(0.3)  # не смикаємо сайт пачкою
+            await asyncio.sleep(0.3 + random.random() * 0.5)  # не смикаємо сайт пачкою і не рівним ритмом
     await _remember_streets(out.streets)
     if not out.houses:
         raise ValueError(f"сайт ДТЕК не віддав жодного будинку ({len(streets)} вулиць)")

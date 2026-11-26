@@ -116,11 +116,14 @@ def schedule_dates(today: date) -> dict[str, date]:
 
 
 async def fetch_dtek(today: date) -> dict[str, DaySchedule]:
-    async with httpx.AsyncClient(timeout=5, follow_redirects=True) as c:
-        r = await c.get(DTEK_URL)
-        r.raise_for_status()
+    import dtek_http
+
+    async with dtek_http.client() as c:
+        r = await dtek_http.request(c, "GET", DTEK_URL)
+        dtek_http.keep(c)
     m = re.search(r"DisconSchedule\.fact\s*=\s*(\{.*?\})\s*;?\s*</script>", r.text, re.S)
     if not m:
+        dtek_http.reset()
         raise ValueError("DisconSchedule.fact не знайдено на сторінці ДТЕК")
     fact = json.loads(m.group(1))
     set_notice("dtek", extract_attention(r.text))
@@ -266,6 +269,9 @@ def demo_schedule() -> Schedule:
 
 
 SITE_CACHE_SEC = 60
+# графік на сайті ДТЕК змінюється рідко, а сторінка важка й під антиботом — смикаємо її рідше
+SITE_CACHE_BY_SOURCE = {"dtek": 3 * 60}
+SITE_TIMEOUT = {"dtek": 40, "yasno": 15, "oua": 15}  # з урахуванням повторної спроби
 SITE_RETRY_SEC = {"dtek": 30 * 60, "yasno": 60, "oua": 5 * 60}
 # Якщо сайт на хвилину не відповів — тримаємо його останню відповідь, а не стрибаємо на графік з каналів:
 # він може відрізнятись, і бот розсилав би «оновився» туди-сюди.
@@ -298,7 +304,7 @@ async def _site_schedule(source: str, provider: str, today: date) -> dict[str, D
             if time.monotonic() < expires and (snapshot is None or day == today):
                 return snapshot if snapshot is not None else _stale(key, today)
         try:
-            async with asyncio.timeout(7):
+            async with asyncio.timeout(SITE_TIMEOUT[source]):
                 if source == "dtek":
                     snapshot = await fetch_dtek(today)
                 elif source == "yasno":
@@ -309,7 +315,7 @@ async def _site_schedule(source: str, provider: str, today: date) -> dict[str, D
             log.warning("%s schedule for %s unavailable: %r", source, provider, exc)
             _site_cache[key] = (today, time.monotonic() + SITE_RETRY_SEC[source], None)
             return _stale(key, today)
-        _site_cache[key] = (today, time.monotonic() + SITE_CACHE_SEC, snapshot)
+        _site_cache[key] = (today, time.monotonic() + SITE_CACHE_BY_SOURCE.get(source, SITE_CACHE_SEC), snapshot)
         _site_last_good[key] = (today, time.monotonic(), snapshot)
         return snapshot
 
