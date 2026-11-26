@@ -248,6 +248,17 @@ class HouseWatchTests(DbCase):
         with patch.object(status, "get_schedule", AsyncMock(return_value={"today": {"1.2": []}})):
             text = await status.verdict("1.2", "dtek")
         self.assertIn("🏠 Сайт ДТЕК: екстрене у 3 з 20 перевірених адрес групи, до <b>18:05", text)
+        self.assertIn("· вул. Х", text)
+        # у мого будинку чисто, а по групі є екстрене — показуємо в блоці «Твій будинок»
+        await db.kv_set("house_seen:1", json.dumps({"kind": None, "ts": int(time.time())}))
+        block = await status.house_block(await db.get_user(1))
+        self.assertIn("✅ відключень немає", block)
+        self.assertIn("Але по групі вже є екстрене", block)
+        self.assertIn("3 з 20", block)
+        # канал теж пише про відключення — рядок сайту не ховаємо
+        await db.add_alert("ch1", "off", "1.2", "13:30", "🚨 <b>Аварійне відключення</b>", "dtek", "channel")
+        with patch.object(status, "get_schedule", AsyncMock(return_value={"today": {"1.2": []}})):
+            self.assertIn("3 з 20 перевірених адрес", await status.verdict("1.2", "dtek"))
 
     async def test_site_check_probes_user_streets_and_pushes(self):
         bot = AsyncMock()

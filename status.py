@@ -230,8 +230,8 @@ async def verdict(grp: str, provider: str) -> str:
         lines.append(f"🚨 Офіційно: {_label(alert['text'])}{till}")
         if alert.get("src") == "dteksite" and (m := re.search(r"🏠 ([^\n]*)", alert["text"])):
             lines.append(f"🏠 {m.group(1)} (сайт ДТЕК)")
-    elif provider == "dtek" and (share := await _group_share(grp, now)):
-        lines.append(share)  # екстрене лише в частини адрес групи — пуш усім не шлемо, але показуємо
+    if provider == "dtek" and not (alert and alert.get("src") == "dteksite") and (share := await _group_share(grp, now)):
+        lines.append(share)  # екстрене хоч на кількох адресах групи — пуш усім не шлемо, але показуємо завжди
     if city_em:
         lines.append("🚨 У Дніпрі діють екстрені відключення — графік зараз не діє")
     if not city_em and not is_emergency_alert(alert) and (sched_line := _schedule_line(today_slots, slot, t)):
@@ -249,7 +249,9 @@ async def _group_share(grp: str, now: datetime) -> str | None:
         return None
     end = re.match(r"(\d{1,2}:\d{2})(?:\s+(\d{2}\.\d{2}))?", s.get("end") or "")
     until = f", до <b>{_short_until(' '.join(x for x in end.groups() if x), now)}</b>" if end else ""
-    return f"🏠 Сайт ДТЕК: екстрене у {s['off']} з {s['total']} перевірених адрес групи{until}"
+    streets = s.get("streets") or []
+    where = (f" · {escape(', '.join(streets))}" + (" та ін." if s["off"] > len(streets) else "")) if streets else ""
+    return f"🏠 Сайт ДТЕК: екстрене у {s['off']} з {s['total']} перевірених адрес групи{until}{where}"
 
 
 async def house_block(user: dict) -> str | None:
@@ -269,7 +271,11 @@ async def house_block(user: dict) -> str | None:
         return f"🏠 <b>Твій будинок</b> ({addr})\n🔴 {seen.get('reason') or 'відключення'}{until} · {checked}"
     if seen.get("kind") == "schedule":
         return f"🏠 <b>Твій будинок</b> ({addr})\n🔴 відключення за графіком · {checked}"
-    return f"🏠 <b>Твій будинок</b> ({addr})\n✅ відключень немає · {checked}"
+    text = f"🏠 <b>Твій будинок</b> ({addr})\n✅ відключень немає · {checked}"
+    if user.get("grp") and (share := await _group_share(user["grp"], now)):
+        # у тебе на сайті чисто, а інші адреси групи вже під екстреним — часто це доходить і до тебе
+        text += "\n⚠️ Але по групі вже є екстрене — можуть вимкнути й тебе:\n" + share
+    return text
 
 
 def _short_until(until: str, now: datetime) -> str:
