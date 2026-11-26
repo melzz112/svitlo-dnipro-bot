@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from html import escape
 
 import db
+import svitlobot
 from config import TZ
 from providers import get_schedule
 from render import hm, now_h
@@ -241,6 +242,8 @@ async def verdict(grp: str, provider: str) -> str:
         lines.append(f"🚨 Офіційно ({src}): {_label(alert['text'])}{till}")
         if alert.get("src") == "dteksite" and (m := re.search(r"🏠 ([^\n]*)", alert["text"])):
             lines.append(f"🏠 {m.group(1)} (сайт ДТЕК)")
+    if sensors := svitlobot.status_line(await svitlobot.group_state(provider, grp)):
+        lines.append(sensors)  # фактичний стан за датчиками в будинках групи
     if city_em:
         lines.append("🚨 У Дніпрі діють екстрені відключення — графік зараз не діє")
     if not city_em and not is_emergency_alert(alert) and (sched_line := _schedule_line(today_slots, slot, t)):

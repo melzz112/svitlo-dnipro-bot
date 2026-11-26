@@ -82,3 +82,16 @@ DISTRICTS = {
     "Індустріальний": [r"індустріальн", r"индустриальн", r"комунар", r"коммунар"],
     "Самарський": [r"самарськ\w* район", r"самарск\w* район"],
 }
+
+# --- Світлобот: датчики світла (кожна точка — чийсь будинок) -> фактичний стан групи ---
+SVITLOBOT_ENABLED = os.getenv("SVITLOBOT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+SVITLOBOT_TOKEN_URL = os.getenv("SVITLOBOT_TOKEN_URL", "https://api.svitlobot.in.ua/website/getMapToken")
+SVITLOBOT_CHANNELS_URL = os.getenv("SVITLOBOT_CHANNELS_URL", "https://api.svitlobot.in.ua/website/getChannelsForMap")
+SVITLOBOT_POLL_INTERVAL = int(os.getenv("SVITLOBOT_POLL_INTERVAL") or 120)
+# регіон у підписі групи точки: «Дніпро (ДТЕК) — група 5.1». «Група 1.1» без регіону — інші області
+SVITLOBOT_REGION = os.getenv("SVITLOBOT_REGION", "Дніпро")
+# лише точки цього міста (слово в адресі до «->»: «Дніпро -> Калинова 82»)
+SVITLOBOT_CITY_FILTER = os.getenv("SVITLOBOT_CITY_FILTER", "Дніпро")
+SVITLOBOT_MIN_SENSORS = int(os.getenv("SVITLOBOT_MIN_SENSORS") or 2)
+SVITLOBOT_ON_THRESHOLD = float(os.getenv("SVITLOBOT_ON_THRESHOLD") or 0.65)
+SVITLOBOT_OFF_THRESHOLD = float(os.getenv("SVITLOBOT_OFF_THRESHOLD") or 0.35)

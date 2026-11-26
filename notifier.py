@@ -15,7 +15,8 @@ import dtek_site
 import keyboards as kb
 import providers
 import status
-from config import CITY, CROWD_MIN, DTEK_PROBE_SEC, SOURCE, TZ
+import svitlobot
+from config import CITY, CROWD_MIN, DTEK_PROBE_SEC, SOURCE, SVITLOBOT_ENABLED, SVITLOBOT_POLL_INTERVAL, TZ
 from providers import get_schedule
 from render import day_text, hm, now_h, now_status
 
@@ -331,11 +332,44 @@ async def site_check(bot: Bot):
             )
 
 
+_svb_next = 0.0
+_svb_fails = 0
+
+
+async def svitlobot_check(bot: Bot):
+    """Датчики Світлобота (раз на SVITLOBOT_POLL_INTERVAL) -> стан кожної групи ДТЕК/ЦЕК; ON<->OFF -> пуш групі.
+    Джерело впало (мережа, 401/403/404/429) — пауза 2×, 4× … до години, решта бота працює далі."""
+    global _svb_next, _svb_fails
+    if not SVITLOBOT_ENABLED or time.monotonic() < _svb_next:
+        return
+    _svb_next = time.monotonic() + SVITLOBOT_POLL_INTERVAL
+    try:
+        points = await svitlobot.fetch_points()
+    except svitlobot.SourceError as e:
+        _svb_fails += 1
+        pause = e.retry_after or min(SVITLOBOT_POLL_INTERVAL * 2 ** _svb_fails, 3600)
+        _svb_next = time.monotonic() + pause
+        log.warning("світлобот: %s — наступна спроба за %d с", e, pause)
+        return
+    _svb_fails = 0
+    changes = await svitlobot.apply(points)
+    if not changes:
+        return
+    users = [u for u in await db.users_with_group() if u["notify_on"]]
+    for c in changes:
+        log.info("світлобот: %s %s -> %s (%d/%d)", c.provider, c.grp, c.state, c.stat.on, c.stat.alive)
+        text = svitlobot.notify_text(c, db.PROVIDER_NAME[c.provider]) + "\n\n<i>За даними датчиків Світлобота</i>"
+        for u in users:
+            if u["grp"] == c.grp and _prov(u) == c.provider:
+                await _send(bot, u["id"], text)
+                await asyncio.sleep(0.05)
+
+
 async def loop(bot: Bot, every=60):
     """Сайт ДТЕК — раз на хвилину; аварії, «люди пишуть» і екстрені — кожні 15 с; графік — раз на хвилину."""
     n = 0
     while True:
-        for job in (site_check, send_alerts, crowd_check, emergency_check) + ((tick,) if n % 4 == 0 else ()):
+        for job in (site_check, svitlobot_check, send_alerts, crowd_check, emergency_check) + ((tick,) if n % 4 == 0 else ()):
             try:
                 await job(bot)
             except Exception:
