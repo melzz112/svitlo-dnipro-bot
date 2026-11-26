@@ -388,7 +388,8 @@ async def apply(probe_: Probe) -> list[str]:
         if st:  # частку бачимо завжди — навіть нижче порогу пуша («🏠 екстрене у 30 з 265 адрес групи»)
             await db.kv_set(f"site_grp:{grp}", json.dumps(
                 {"total": st.total, "off": len(st.off), "end": st.end, "ts": int(time.time()),
-                 "streets": list(dict.fromkeys(h.street for h in st.off))[:3]}, ensure_ascii=False
+                 "streets": list(dict.fromkeys(h.street for h in st.off))[:3],
+                 "n_streets": len({h.street for h in st.off})}, ensure_ascii=False
             ))
         prev = json.loads(await db.kv_get(f"site_em:{grp}") or "null")
         if st and st.off and len(st.off) >= MIN_SHARE * st.total:

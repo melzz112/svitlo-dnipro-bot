@@ -181,7 +181,7 @@ class SiteAlertTests(DbTestCase):
         self.assertIn("🔴 <b>Світла немає</b>", now)
         self.assertIn("екстрене відключення", now)
         self.assertIn("до <b>17:16", now)
-        self.assertIn("3 з 4 перевірених адрес групи (сайт ДТЕК)", now)
+        self.assertIn("🚨 Офіційно (сайт ДТЕК): екстрене у 3 з 4 перевірених адрес групи", now)
         self.assertNotIn("локальна аварія", now)
 
         self.assertEqual(await self.check(street_payload()), [])  # той самий стан — без повторів
@@ -213,7 +213,7 @@ class SiteAlertTests(DbTestCase):
             await db.add_chat_msg("chat", "1.2 дали", None, "on", ["1.2"], who=who)
         text = await self.verdict()
         self.assertIn("🟡 <b>Є світло, але не в усіх</b>", text)
-        self.assertIn("Офіційно:", text)
+        self.assertIn("Офіційно (сайт ДТЕК)", text)
 
 
 class CityEmergencyTests(DbTestCase):

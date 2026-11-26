@@ -160,6 +160,11 @@ async def verdict(grp: str, provider: str) -> str:
     city_em = await db.get_emergency(provider)  # у місті діють екстрені — графік не діє
     t = now_h()
     alert, slot, start, until = await official_outage(grp, provider, sch, now)
+    channel_until = until
+    # сайт ДТЕК (адреси групи з екстреним) — головне офіційне джерело; канали лише доповнюють
+    site = await _site_group(grp, now) if provider == "dtek" else None
+    if site and site.get("off") and (site_until := _site_until(site, now)):
+        until = site_until
     today_slots = sch.get("today", {}).get(grp)
     note = None
 
@@ -226,12 +231,16 @@ async def verdict(grp: str, provider: str) -> str:
             lines.append(f"     за 30 хв:  💡 є — {r_on}  ·  🕯 нема — {r_off}")
     if note:
         lines.append(note)
-    if alert:
-        lines.append(f"🚨 Офіційно: {_label(alert['text'])}{till}")
+    if share := await _group_share(grp, now, "🚨 Офіційно (сайт ДТЕК)") if provider == "dtek" else None:
+        lines.append(share)  # екстрене хоч на кількох адресах групи — пуш усім не шлемо, але показуємо завжди
+        if alert and alert.get("src") != "dteksite":
+            ch_till = f" до {channel_until}" if channel_until else ""
+            lines.append(f"📢 Канали: {_label(alert['text'])}{ch_till}")
+    elif alert:
+        src = "сайт ДТЕК" if alert.get("src") == "dteksite" else "канали"
+        lines.append(f"🚨 Офіційно ({src}): {_label(alert['text'])}{till}")
         if alert.get("src") == "dteksite" and (m := re.search(r"🏠 ([^\n]*)", alert["text"])):
             lines.append(f"🏠 {m.group(1)} (сайт ДТЕК)")
-    if provider == "dtek" and not (alert and alert.get("src") == "dteksite") and (share := await _group_share(grp, now)):
-        lines.append(share)  # екстрене хоч на кількох адресах групи — пуш усім не шлемо, але показуємо завжди
     if city_em:
         lines.append("🚨 У Дніпрі діють екстрені відключення — графік зараз не діє")
     if not city_em and not is_emergency_alert(alert) and (sched_line := _schedule_line(today_slots, slot, t)):
@@ -242,16 +251,28 @@ async def verdict(grp: str, provider: str) -> str:
 FRESH_SEC = 15 * 60  # дані перевірки адрес на сайті ДТЕК вважаємо свіжими 15 хв
 
 
-async def _group_share(grp: str, now: datetime) -> str | None:
-    """«🏠 Сайт ДТЕК: екстрене у 30 з 265 перевірених адрес групи, до 18:05» (дані ≤15 хв)."""
+async def _site_group(grp: str, now: datetime) -> dict | None:
+    """Свіжий (≤15 хв) підсумок перевірки адрес групи на сайті ДТЕК: {"total", "off", "end", "streets"}."""
     s = json.loads(await db.kv_get(f"site_grp:{grp}") or "null")
-    if not s or not s.get("off") or now.timestamp() - s.get("ts", 0) > FRESH_SEC:
+    if not s or now.timestamp() - s.get("ts", 0) > FRESH_SEC:
         return None
+    return s
+
+
+def _site_until(s: dict, now: datetime) -> str | None:
     end = re.match(r"(\d{1,2}:\d{2})(?:\s+(\d{2}\.\d{2}))?", s.get("end") or "")
-    until = f", до <b>{_short_until(' '.join(x for x in end.groups() if x), now)}</b>" if end else ""
+    return _short_until(" ".join(x for x in end.groups() if x), now) if end else None
+
+
+async def _group_share(grp: str, now: datetime, prefix: str = "🏠 Сайт ДТЕК") -> str | None:
+    """«🏠 Сайт ДТЕК: екстрене у 30 з 265 перевірених адрес групи, до 18:05 · вул. …» (дані ≤15 хв)."""
+    s = await _site_group(grp, now)
+    if not s or not s.get("off"):
+        return None
+    until = f", до <b>{u}</b>" if (u := _site_until(s, now)) else ""
     streets = s.get("streets") or []
-    where = (f" · {escape(', '.join(streets))}" + (" та ін." if s["off"] > len(streets) else "")) if streets else ""
-    return f"🏠 Сайт ДТЕК: екстрене у {s['off']} з {s['total']} перевірених адрес групи{until}{where}"
+    where = (f" · {escape(', '.join(streets))}" + (" та ін." if s.get("n_streets", 0) > len(streets) else "")) if streets else ""
+    return f"{prefix}: екстрене у {s['off']} з {s['total']} перевірених адрес групи{until}{where}"
 
 
 async def house_block(user: dict) -> str | None:
