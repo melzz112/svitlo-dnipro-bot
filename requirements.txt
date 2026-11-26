@@ -5,3 +5,4 @@ telethon>=1.36
 python-dotenv>=1.0
 tzdata
 aiohttp>=3.9
+curl_cffi>=0.10

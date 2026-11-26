@@ -115,7 +115,7 @@ class SiteProbeTests(unittest.IsolatedAsyncioTestCase):
 
         async_client = httpx.AsyncClient
         with patch.object(dtek_site.httpx, "AsyncClient", side_effect=lambda **kw: async_client(
-            transport=httpx.MockTransport(respond), **kw,
+            **{**kw, "transport": httpx.MockTransport(respond)},
         )), patch.object(dtek_site.asyncio, "sleep", AsyncMock()):
             result = await dtek_site.probe(["вул. Микитинська", "вул. Неіснуюча"])
         self.assertEqual(len(result.houses), 6)
@@ -130,7 +130,7 @@ class SiteProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_antibot_page_is_an_error(self):
         async_client = httpx.AsyncClient
         with patch.object(dtek_site.httpx, "AsyncClient", side_effect=lambda **kw: async_client(
-            transport=httpx.MockTransport(lambda r: httpx.Response(200, text='<iframe src="/_Incapsula_Resource">')), **kw,
+            **{**kw, "transport": httpx.MockTransport(lambda r: httpx.Response(200, text='<iframe src="/_Incapsula_Resource">'))},
         )):
             with self.assertRaises(ValueError):
                 await dtek_site.probe(["вул. Микитинська"])
@@ -352,7 +352,7 @@ _real_client = httpx.AsyncClient
 
 
 def _client(data, **kw):
-    return _real_client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=data)), **kw)
+    return _real_client(**{**kw, "transport": httpx.MockTransport(lambda r: httpx.Response(200, json=data))})
 
 
 if __name__ == "__main__":

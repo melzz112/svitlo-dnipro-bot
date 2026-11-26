@@ -3,25 +3,79 @@
 Раніше кожен запит ішов з порожніми кукі і заголовком python-httpx: сайт щоразу відповідав 302 (перевірка
 Incapsula) і інколи віддавав сторінку без даних. Тепер — заголовки звичайного браузера, кукі живуть між
 запитами, на таймаут/5xx — ще одна спроба з паузою; якщо сайт віддав «порожню» сторінку — кукі скидаємо.
+
+Сам запит іде через curl_cffi з відбитком TLS/HTTP2 справжнього Chrome (impersonate): Incapsula дивиться
+не лише на заголовки, а й на те, як клієнт «рукостискається», і python-ssl від httpx видає бота одразу.
+Зверху лишається httpx (кукі, редиректи, raise_for_status, винятки httpx.*) — решта коду не змінилась.
+Немає curl_cffi — працює звичайний httpx.
 """
 import asyncio
+import logging
 import random
 
 import httpx
 
+try:
+    from curl_cffi import requests as curl_requests
+    from curl_cffi.requests import exceptions as curl_exc
+except ImportError:  # pragma: no cover — без curl_cffi лишається звичайний httpx
+    curl_requests = None
+
+log = logging.getLogger(__name__)
+
+IMPERSONATE = "chrome"  # останній Chrome, який знає встановлений curl_cffi
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "uk-UA,uk;q=0.9,ru;q=0.8,en-US;q=0.7,en;q=0.6",
 }
+# Без curl_cffi сами вдаємо браузер заголовком; з ним User-Agent ставить impersonate — у парі з відбитком TLS.
+FALLBACK_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/131.0.0.0 Safari/537.36")
 TIMEOUT = 15
+
+# Ці заголовки curl ставить сам, як справжній Chrome (і сам розпаковує gzip/br), — від httpx їх не передаємо.
+_DROP_REQ = {"host", "connection", "accept-encoding", "user-agent", "content-length", "transfer-encoding"}
+# Тіло вже розпаковане curl'ом — щоб httpx не розпаковував удруге і не звіряв довжину.
+_DROP_RESP = {"content-encoding", "content-length", "transfer-encoding"}
 
 _cookies = httpx.Cookies()
 
 
+class CurlTransport(httpx.AsyncBaseTransport):
+    """httpx-транспорт поверх curl_cffi: кукі й редиректи — на боці httpx, curl лише ходить у мережу."""
+
+    def __init__(self, impersonate: str = IMPERSONATE):
+        self._s = curl_requests.AsyncSession(impersonate=impersonate)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        headers = [(k, v) for k, v in request.headers.multi_items() if k.lower() not in _DROP_REQ]
+        t = request.extensions.get("timeout") or {}
+        timeout = (t.get("connect") or TIMEOUT, t.get("read") or TIMEOUT)
+        body = await request.aread()
+        self._s.cookies.clear()  # кукі веде httpx (спільна банка _cookies) — curl свої не підмішує
+        try:
+            r = await self._s.request(
+                request.method, str(request.url), headers=headers, data=body or None,
+                timeout=timeout, allow_redirects=False,
+            )
+        except curl_exc.Timeout as e:
+            raise httpx.ReadTimeout(str(e), request=request) from e
+        except curl_exc.RequestException as e:
+            raise httpx.ConnectError(str(e), request=request) from e
+        out = [(k, v) for k, v in r.headers.multi_items() if k.lower() not in _DROP_RESP]
+        return httpx.Response(r.status_code, headers=out, content=r.content, request=request)
+
+    async def aclose(self):
+        await self._s.close()
+
+
 def client(timeout: float = TIMEOUT) -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=HEADERS, cookies=_cookies)
+    kw = {"timeout": timeout, "follow_redirects": True, "headers": dict(HEADERS), "cookies": _cookies}
+    if curl_requests:
+        kw["transport"] = CurlTransport()
+    else:
+        kw["headers"]["User-Agent"] = FALLBACK_UA
+    return httpx.AsyncClient(**kw)
 
 
 def keep(c: httpx.AsyncClient):

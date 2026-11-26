@@ -62,7 +62,7 @@ class ScheduleSourceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.multiple(providers, SOURCE="yasno", CITY="dnipro", _site_cache={}, _site_locks={}),
             patch.object(providers.httpx, "AsyncClient", side_effect=lambda **kwargs: async_client(
-                transport=httpx.MockTransport(respond), **kwargs,
+                **{**kwargs, "transport": httpx.MockTransport(respond)},
             )),
             patch.object(providers, "channel_schedule", AsyncMock(return_value=DaySchedule())),
         ):
@@ -94,7 +94,7 @@ class ScheduleSourceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.multiple(providers, SOURCE="dtek", CITY="dnipro", _site_cache={}, _site_locks={}),
             patch.object(providers.httpx, "AsyncClient", side_effect=lambda **kwargs: async_client(
-                transport=httpx.MockTransport(respond), **kwargs,
+                **{**kwargs, "transport": httpx.MockTransport(respond)},
             )),
             patch.object(providers, "channel_schedule", AsyncMock()) as channel,
             self.assertLogs("providers", "WARNING"),

@@ -139,7 +139,7 @@ def mock_site(street_houses: dict, page_html=None):
 
     client = httpx.AsyncClient
     return posts, patch.object(dtek_site.httpx, "AsyncClient", side_effect=lambda **kw: client(
-        transport=httpx.MockTransport(respond), **kw))
+        **{**kw, "transport": httpx.MockTransport(respond)}))
 
 
 class DbCase(unittest.IsolatedAsyncioTestCase):
