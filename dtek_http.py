@@ -8,12 +8,16 @@ Incapsula) і інколи віддавав сторінку без даних. 
 не лише на заголовки, а й на те, як клієнт «рукостискається», і python-ssl від httpx видає бота одразу.
 Зверху лишається httpx (кукі, редиректи, raise_for_status, винятки httpx.*) — решта коду не змінилась.
 Немає curl_cffi — працює звичайний httpx.
+
+DTEK_PROXY у .env — усі запити до ДТЕК ідуть через проксі (з VPS Incapsula блокує сам IP).
 """
 import asyncio
 import logging
 import random
 
 import httpx
+
+from config import DTEK_PROXY
 
 try:
     from curl_cffi import requests as curl_requests
@@ -44,8 +48,8 @@ _cookies = httpx.Cookies()
 class CurlTransport(httpx.AsyncBaseTransport):
     """httpx-транспорт поверх curl_cffi: кукі й редиректи — на боці httpx, curl лише ходить у мережу."""
 
-    def __init__(self, impersonate: str = IMPERSONATE):
-        self._s = curl_requests.AsyncSession(impersonate=impersonate)
+    def __init__(self, impersonate: str = IMPERSONATE, proxy: str | None = None):
+        self._s = curl_requests.AsyncSession(impersonate=impersonate, proxy=proxy)
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         headers = [(k, v) for k, v in request.headers.multi_items() if k.lower() not in _DROP_REQ]
@@ -72,9 +76,10 @@ class CurlTransport(httpx.AsyncBaseTransport):
 def client(timeout: float = TIMEOUT) -> httpx.AsyncClient:
     kw = {"timeout": timeout, "follow_redirects": True, "headers": dict(HEADERS), "cookies": _cookies}
     if curl_requests:
-        kw["transport"] = CurlTransport()
+        kw["transport"] = CurlTransport(proxy=DTEK_PROXY)
     else:
         kw["headers"]["User-Agent"] = FALLBACK_UA
+        kw["proxy"] = DTEK_PROXY
     return httpx.AsyncClient(**kw)
 
 
