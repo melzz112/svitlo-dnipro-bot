@@ -16,7 +16,7 @@ async def main():
     if not BOT_TOKEN:
         raise SystemExit("Вкажи BOT_TOKEN у .env")
     await db.init()
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML", link_preview_is_disabled=True))
     dp = Dispatcher()
 
     @dp.update.outer_middleware()

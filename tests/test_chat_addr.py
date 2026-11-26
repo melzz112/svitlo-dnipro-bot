@@ -25,6 +25,20 @@ class CleanTests(unittest.TestCase):
         self.assertEqual(clean_chat_text("🔴 1.2 нема 🙏"), "🔴 1.2 нема 🙏")  # поодинокі емодзі лишаються
         self.assertEqual(clean_chat_text("1.2 дали) ура)))"), "1.2 дали) ура)))")
 
+    def test_links_removed(self):
+        from parse import parse_channel
+        post = ("📢 Екстрені відключення на окремих адресах районів продовжили. Орієнтовні строки завершення:\n"
+                "• Амур-Нижньодніпровський — для різних адрес до 15:53 або 17:20\n"
+                "• Індустріальний, Чечелівський і Шевченківський — до 17:20\n"
+                "Графік відключень - https://t.me/+9fuAjv24ktgxM2My\nПідписатись: @vklyuchatel_dnepr_svet")
+        [a] = parse_channel(post)
+        self.assertTrue(a.text.startswith("📢 Екстрені"))
+        self.assertNotIn("📢 📢", a.text)
+        for junk in ("http", "t.me", "@", "Графік відключень", "Підписатись"):
+            self.assertNotIn(junk, a.text)
+        self.assertIn("завершення:", a.text)
+        self.assertEqual(clean_chat_text("1.2 дали https://t.me/x"), "1.2 дали")
+
     def test_key_ignores_emoji(self):
         self.assertEqual(chat_key(SPAM), chat_key(clean_chat_text(SPAM)))
         self.assertNotEqual(chat_key("1.2 нема"), chat_key("1.2 дали"))

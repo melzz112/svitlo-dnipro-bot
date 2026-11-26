@@ -50,7 +50,7 @@ PUNCT_RUN = re.compile(r"([!?.)(])\1{3,}")
 
 def clean_chat_text(text: str) -> str:
     """Спам у чатах: «🛑🛑🛑…🛑1.2 Анд …🛑🛑🛑», «‼️‼️‼️‼️ група 1.2 …», «!!!!!!!» -> один символ / «!!!»."""
-    t = EMOJI_RUN.sub(lambda m: m.group(1) + " ", text or "")
+    t = EMOJI_RUN.sub(lambda m: m.group(1) + " ", URL_RE.sub("", text or ""))
     t = PUNCT_RUN.sub(lambda m: m.group(1) * 3, t)
     return re.sub(r"[ \t]+", " ", t).strip()
 
@@ -211,8 +211,30 @@ def _on(grp, label):
     return Alert("on", grp, None, f"✅ Група <b>{grp}</b>: {label}")
 
 
+URL_RE = re.compile(r"(?:https?://|www\.|t\.me/|telegram\.me/)\S+", re.I)
+MENTION_RE = re.compile(r"(?<![\w.])@\w{4,}")
+
+
+def strip_links(text: str) -> str:
+    """Пости каналів -> лише текст: без посилань (https://t.me/+…, www…), @каналів і рядків, які були лише
+    підписом до посилання («Графік відключень - https://…» -> рядок прибираємо)."""
+    out = []
+    for line in text.splitlines():
+        if not (URL_RE.search(line) or MENTION_RE.search(line)):
+            out.append(line)
+            continue
+        line = re.sub(r"[ \t]{2,}", " ", MENTION_RE.sub("", URL_RE.sub("", line)))
+        line = re.sub(r"[\s:–—\-|→👉⬇️⤵️]+$", "", line).strip()  # «Графік відключень -» без хвоста-стрілки
+        if len(re.sub(r"\W+", "", line)) < 25:
+            continue  # «Графік відключень», «Підписатись», «👉 @канал» — без посилання сенсу немає
+        out.append(line)
+    return "\n".join(out)
+
+
 def _general(text: str) -> Alert:
-    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    lines = [x.strip() for x in strip_links(text).splitlines() if x.strip()]
+    if lines:
+        lines[0] = re.sub(r"^📢\s*", "", lines[0])  # канал сам починає з 📢 — не дублюємо
     short = "\n".join(lines[:4])
     if len(lines) > 4 or len(short) > 300:
         short = short[:300] + "…"
