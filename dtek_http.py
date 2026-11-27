@@ -117,6 +117,7 @@ class BrowserSession:
     ts: float
     csrf: str | None = None
     domains: dict[str, str] = field(default_factory=dict)  # кука -> домен (для curl)
+    update: str | None = None  # DisconSchedule.fact.update зі сторінки (поле updateFact у запитах)
     stale: bool = False
 
     def fresh(self) -> bool:
@@ -148,7 +149,7 @@ def _load_cache():
     try:
         with open(DTEK_COOKIE_CACHE, encoding="utf-8") as f:
             data = _json.load(f)
-        _browser = BrowserSession(**{k: data[k] for k in ("cookies", "user_agent", "ts", "csrf", "domains") if k in data})
+        _browser = BrowserSession(**{k: data[k] for k in ("cookies", "user_agent", "ts", "csrf", "domains", "update") if k in data})
     except (OSError, ValueError, TypeError, KeyError):
         _browser = None
 
@@ -213,7 +214,8 @@ async def _launch_browser() -> BrowserSession:
                 domains[c.name] = c.domain
         if not cookies:
             raise DtekError("браузер не отримав кукі сайту ДТЕК")
-        return BrowserSession(cookies, str(user_agent or ""), time.time(), _csrf(html), domains)
+        upd = re.search(r'DisconSchedule\.fact\s*=\s*\{.*?"update"\s*:\s*"([^"]+)"', html or "", re.S)
+        return BrowserSession(cookies, str(user_agent or ""), time.time(), _csrf(html), domains, upd and upd.group(1))
     finally:
         if browser is not None:
             try:
@@ -262,10 +264,34 @@ async def refresh_browser_session(force: bool = False) -> BrowserSession | None:
             return None
         _browser = new
         _save_cache(new)
-        await reset()  # наступний запит — нова сесія curl з цими кукі
+        await reset(keep_page=True)  # наступний запит — нова сесія curl з цими кукі
+        if new.csrf:  # токен зі сторінки браузера — під його кукі; сторінку curl'ом не тягнемо
+            remember_page(new.csrf, new.update)
         log.info("ДТЕК: браузерна сесія оновлена за %.1f с (%d кукі: %s)", time.monotonic() - started,
                  len(new.cookies), ", ".join(sorted(new.cookies))[:200])
         return new
+
+
+# ---------- сторінка відключень: csrf під поточні кукі (сторінку ~800 КБ тягнемо не щоциклу) ----------
+
+_page: dict | None = None  # {"ts", "csrf", "update"} — з останньої сторінки curl або браузера
+
+
+def remember_page(csrf: str, update: str | None = None):
+    global _page
+    _page = {"ts": time.time(), "csrf": csrf, "update": update if update is not None else (_page or {}).get("update")}
+
+
+def cached_page() -> dict | None:
+    """Свіжий (< DTEK_COOKIE_TTL_SEC) токен під поточні кукі — AJAX можна слати без завантаження сторінки."""
+    if _page and _page.get("csrf") and time.time() - _page["ts"] < DTEK_COOKIE_TTL_SEC:
+        return _page
+    return None
+
+
+def current_csrf(default: str | None) -> str | None:
+    """Кукі могли оновитись посеред циклу (браузер) — тоді й токен беремо новий."""
+    return (cached_page() or {}).get("csrf") or default
 
 
 async def ensure_browser_session():
@@ -277,9 +303,12 @@ async def ensure_browser_session():
         await refresh_browser_session()
 
 
-async def reset():
-    """Антибот — наступного разу починаємо з чистими кукі (нова сесія)."""
-    global _session
+async def reset(keep_page: bool = False):
+    """Антибот — наступного разу починаємо з чистими кукі (нова сесія). Кукі нові — і csrf під них теж
+    потрібен новий (keep_page — лише коли щойно взяли і кукі, і токен з браузера)."""
+    global _session, _page
+    if not keep_page:
+        _page = None
     s, _session = _session, None
     if s is not None:
         try:
@@ -386,9 +415,12 @@ def ajax_form(method: str, fields: list[tuple[str, str]]) -> dict[str, str]:
 
 async def ajax(form: dict, csrf: str | None, *, use_backoff: bool = True) -> dict:
     """POST /ua/ajax -> JSON. Замість JSON прийшла сторінка (антибот) -> Blocked."""
+    if use_backoff and backoff_left():
+        raise Backoff(f"пауза ще {int(backoff_left())} с ({_backoff_reason})")
+    await ensure_browser_session()  # кукі оновлюємо до того, як обрати csrf під них
     headers = dict(AJAX_HEADERS)
-    if csrf:
-        headers["X-CSRF-Token"] = csrf
+    if token := current_csrf(csrf):
+        headers["X-CSRF-Token"] = token
     r = await request("POST", AJAX_URL, data=form, headers=headers, use_backoff=use_backoff)
     try:
         payload = r.json()
@@ -397,8 +429,8 @@ async def ajax(form: dict, csrf: str | None, *, use_backoff: bool = True) -> dic
         payload = None
         if await _refresh_after_block():  # нові кукі -> той самий запит ще раз, з csrf зі сторінки браузера
             bs = browser_session()
-            if bs and bs.csrf:
-                headers["X-CSRF-Token"] = bs.csrf
+            if token := current_csrf(bs and bs.csrf):
+                headers["X-CSRF-Token"] = token
             r = await request("POST", AJAX_URL, data=form, headers=headers, use_backoff=use_backoff, _retry=False)
             try:
                 payload = r.json()

@@ -235,8 +235,8 @@ class HouseWatchTests(DbCase):
         self.assertIn("сайт ДТЕК", block)
         await db.kv_set("house_seen:1", json.dumps({"kind": None, "ts": int(time.time())}))
         self.assertIn("✅ відключень немає", await status.house_block(await db.get_user(1)))
-        # опитування раз на 30 хв: дані 25-хвилинної давності — ще свіжі, не «сайт не відповідає»
-        await db.kv_set("house_seen:1", json.dumps({"kind": None, "ts": int(time.time()) - 25 * 60}))
+        # опитування раз на 10 хв: дані 15-хвилинної давності — ще свіжі (інтервал + 10 хв запасу)
+        await db.kv_set("house_seen:1", json.dumps({"kind": None, "ts": int(time.time()) - 15 * 60}))
         self.assertIn("✅ відключень немає", await status.house_block(await db.get_user(1)))
         await db.kv_set("house_seen:1", json.dumps({"kind": None, "ts": int(time.time()) - 3600}))
         await db.kv_set("site_probe", json.dumps({"ok": True, "ts": int(time.time()) - 10 * 60}))

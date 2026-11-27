@@ -27,10 +27,12 @@ from groups import DEFAULT as GROUPS  # noqa: E402 — типові 1.1 … 6.2;
 # Сайт ДТЕК, «Перевірити адресу». Повний довідник вулиць і будинків збирає scripts/seed_streets.py (з ПК з
 # українським IP) у таблиці dtek_streets / dtek_houses; на сервері сайт смикаємо бережно:
 # - лише вулиці, де є підписники (адреси людей, будинки без черги, адреси «⏳ чекає на сайт»);
-# - раз на DTEK_POLL_INTERVAL_SEC, з паузою DTEK_POLL_PAUSE_MIN…MAX с між запитами;
+# - раз на DTEK_POLL_INTERVAL_SEC (10 хв; під час аварій — DTEK_POLL_FAST_SEC, 5 хв), з паузою DTEK_POLL_PAUSE_MIN…MAX с між запитами;
 # - помилка чи антибот -> DTEK_BACKOFF_SEC тиші (жодного запиту до сайту).
 DTEK_STREETS = _list("DTEK_STREETS")  # додаткові контрольні вулиці (за замовчуванням — жодної)
-DTEK_POLL_INTERVAL_SEC = int(os.getenv("DTEK_POLL_INTERVAL_SEC") or 1800)
+DTEK_POLL_INTERVAL_SEC = int(os.getenv("DTEK_POLL_INTERVAL_SEC") or 600)  # спокійно — раз на 10 хв
+# екстрені в місті, у когось із підписників зараз нема світла чи аварія по його черзі — раз на 5 хв
+DTEK_POLL_FAST_SEC = int(os.getenv("DTEK_POLL_FAST_SEC") or 300)
 if os.getenv("DTEK_PROBE_SEC", "").strip() == "0":  # стара змінна: лише «0 — вимкнути»; 900 з неї вже не діє
     DTEK_POLL_INTERVAL_SEC = 0
 DTEK_POLL_PAUSE_MIN = float(os.getenv("DTEK_POLL_PAUSE_MIN") or 3)

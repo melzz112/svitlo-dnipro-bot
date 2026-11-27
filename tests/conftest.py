@@ -22,6 +22,7 @@ def _isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(dtek_http, "_browser", None)
     monkeypatch.setattr(dtek_http, "_browser_loaded", False)
     monkeypatch.setattr(dtek_http, "_browser_last_try", 0.0)
+    monkeypatch.setattr(dtek_http, "_page", None)
     asyncio.run(db.init())
     groups.reset()
     dtek_http.clear_backoff()

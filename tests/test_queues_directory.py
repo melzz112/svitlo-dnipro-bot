@@ -413,3 +413,32 @@ class SeedTests(DbCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PollIntervalTests(DbCase):
+    async def test_fast_while_outage_calm_otherwise(self):
+        await db.set_user(1, grp="14.1", provider="dtek", street="вул. Березинська", house="43")
+        users = await db.users_with_address()
+        self.assertEqual(await notifier.poll_interval(users), 600)
+        await db.kv_set("house:1", json.dumps({"start": "", "end": "", "miss": 0}))  # у підписника нема світла
+        self.assertEqual(await notifier.poll_interval(users), 300)
+        await db.kv_set("house:1", "")
+        self.assertEqual(await notifier.poll_interval(users), 600)
+        end = int(time.time()) + 3600
+        await db.upsert_incident("dtek", "14.1", "вул. Космічна", "аварійні ремонтні роботи", None, end)
+        self.assertEqual(await notifier.poll_interval(users), 300)  # аварія по його черзі
+        await db.expire_incidents(end + 1)
+        await db.set_emergency("dtek", {"since": 1, "text": ""})
+        self.assertEqual(await notifier.poll_interval(users), 300)  # екстрені в місті
+
+    async def test_site_check_schedules_next_poll(self):
+        await db.set_user(1, grp="14.1", provider="dtek", street="вул. Березинська", house="43")
+        off = dtek_house("14.1", EMERGENCY, f"13:00 {TOMORROW}", f"18:00 {TOMORROW}")
+        probe = dtek_site.Probe(dtek_site.parse_houses("вул. Березинська", {"data": {"43": off}}), page_fetched=False)
+        with patch.object(dtek_site, "probe", AsyncMock(return_value=probe)), \
+                patch.multiple(notifier, _site_next=0.0, SOURCE="dtek", CITY="dnipro"), \
+                patch.object(notifier.providers, "set_notice") as notice:
+            await notifier.site_check(AsyncMock())
+            left = notifier._site_next - time.monotonic()
+        self.assertTrue(250 < left <= 300, left)  # у будинку підписника зараз аварія -> раз на 5 хв
+        notice.assert_not_called()  # сторінку не тягнули — вікно «Шановні клієнти!» не затираємо

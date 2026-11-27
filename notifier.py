@@ -16,7 +16,7 @@ import keyboards as kb
 import providers
 import status
 import svitlobot
-from config import (CITY, CROWD_MIN, DTEK_POLL_INTERVAL_SEC, DTEK_STREETS, SOURCE, SVITLOBOT_ENABLED,
+from config import (CITY, CROWD_MIN, DTEK_POLL_FAST_SEC, DTEK_POLL_INTERVAL_SEC, DTEK_STREETS, SOURCE, SVITLOBOT_ENABLED,
                     SVITLOBOT_POLL_INTERVAL, TZ)
 from providers import get_schedule
 from render import day_text, hm, now_h, now_status
@@ -362,6 +362,7 @@ async def site_check(bot: Bot):
     streets, addr_users, pending, cands = await subscriber_streets()
     if not streets:
         return  # підписників з адресою немає — сайт не смикаємо зовсім
+    started = time.monotonic()
     try:
         probe = await dtek_site.probe(streets)
     except dtek_http.ERRORS as e:
@@ -370,7 +371,8 @@ async def site_check(bot: Bot):
         await db.kv_set("site_probe", json.dumps({"ok": False, "ts": int(time.time()), "err": str(e)[:80]}, ensure_ascii=False))
         return
     await db.kv_set("site_probe", json.dumps({"ok": True, "ts": int(time.time()), "houses": len(probe.houses)}))
-    providers.set_notice("dtek", probe.attention)  # заодно свіже вікно «Шановні клієнти!»
+    if probe.page_fetched:  # сторінку тягнули (раз на ~20 хв) — заодно свіже вікно «Шановні клієнти!»
+        providers.set_notice("dtek", probe.attention)
     for u, street, h in dtek_site.resolve_pending(probe, pending, cands):
         await _send(bot, u["id"], await _finish_address(u, street, h))
         await asyncio.sleep(0.05)
@@ -381,9 +383,36 @@ async def site_check(bot: Bot):
         await asyncio.sleep(0.05)
     if n := await dtek_site.record_incidents(probe.houses):
         log.info("сайт ДТЕК: нових аварій по чергах: %d", n)
+    interval = await poll_interval(addr_users)
+    _site_next = started + interval
     if time.monotonic() - _site_warned > 3600 and probe.failed:
         _site_warned = time.monotonic()
         log.warning("сайт ДТЕК: вулиці без відповіді: %s", ", ".join(probe.failed))
+
+
+_fast_mode = False
+
+
+async def poll_interval(addr_users: list[dict]) -> int:
+    """10 хв спокійно; 5 хв, поки в місті екстрені, у когось із підписників зараз нема світла (сайт ДТЕК)
+    чи по його черзі є аварія — щоб швидко сказати і про продовження, і «світло повернулось»."""
+    global _fast_mode
+    reason = None
+    if DTEK_POLL_FAST_SEC and DTEK_POLL_FAST_SEC < DTEK_POLL_INTERVAL_SEC:
+        if await db.get_emergency("dtek"):
+            reason = "екстрені в місті"
+        elif any([await db.kv_get(f"house:{u['id']}") for u in addr_users]):
+            reason = "у підписника нема світла"
+        else:
+            for g in {u["grp"] for u in addr_users if u.get("grp")}:
+                if await db.active_incidents("dtek", g):
+                    reason = f"аварія по черзі {g}"
+                    break
+    if bool(reason) != _fast_mode:
+        _fast_mode = bool(reason)
+        log.info("сайт ДТЕК: опитування раз на %d хв%s", (DTEK_POLL_FAST_SEC if reason else DTEK_POLL_INTERVAL_SEC) // 60,
+                 f" ({reason})" if reason else "")
+    return DTEK_POLL_FAST_SEC if reason else DTEK_POLL_INTERVAL_SEC
 
 
 INCIDENT_MERGE_SEC = 60 * 60  # та сама причина по групі з кінцем у межах години — те саме відключення, не новина

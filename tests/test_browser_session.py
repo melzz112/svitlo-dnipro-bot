@@ -221,3 +221,47 @@ class CurlTests(BrowserCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PageCacheTests(BrowserCase):
+    """Сторінку (~800 КБ) тягнемо раз на DTEK_COOKIE_TTL_SEC, а не щоциклу: csrf під поточні кукі вже є."""
+
+    async def test_second_probe_skips_page(self):
+        import dtek_site
+        from test_queues_directory import dtek_house, page
+
+        def respond(method, url, form):
+            if method == "GET":
+                return 200, page(["вул. Робоча"])
+            return 200, {"result": True, "data": {"5": dtek_house("14.1")}}
+
+        with fake_dtek(respond) as s, patch.object(dtek_site.asyncio, "sleep"):
+            first = await dtek_site.probe(["вул. Робоча"])
+            second = await dtek_site.probe(["вул. Робоча"])
+        self.assertEqual([m for m, *_ in s.calls], ["GET", "POST", "POST"])
+        self.assertTrue(first.page_fetched)
+        self.assertFalse(second.page_fetched)
+        self.assertEqual(s.calls[-1][2]["data[2][value]"], "20.11.2026 13:35")  # updateFact з кешу сторінки
+        self.assertEqual(s.calls[-1][3]["X-CSRF-Token"], "tok")
+        with patch.object(dtek_http, "_page", {**dtek_http._page, "ts": time.time() - 1300}), \
+                fake_dtek(respond) as s2, patch.object(dtek_site.asyncio, "sleep"):
+            await dtek_site.probe(["вул. Робоча"])
+        self.assertEqual([m for m, *_ in s2.calls], ["GET", "POST"])  # токен старший за 20 хв — нова сторінка
+
+    async def test_browser_csrf_means_no_page_at_all(self):
+        import dtek_site
+
+        nd = self.use(FakeNodriver())
+        with fake_dtek(lambda m, u, f: (200, {"result": True, "data": {"1": {}}})) as s, \
+                patch.object(dtek_site.asyncio, "sleep"):
+            await dtek_site.probe(["вул. Робоча"])
+        self.assertEqual(nd.starts, 1)
+        self.assertEqual([m for m, *_ in s.calls], ["POST"])  # кукі й csrf — з браузера, сторінку curl не тягне
+        self.assertEqual(s.calls[0][3]["X-CSRF-Token"], "browser-tok")
+
+    async def test_antibot_drops_cached_csrf(self):
+        dtek_http.remember_page("tok", "upd")
+        with fake_dtek(lambda m, u, f: (200, '<iframe src="/_Incapsula_Resource">')):
+            with self.assertRaises(dtek_http.Blocked):
+                await dtek_http.ajax({"method": "getHomeNum"}, "tok", use_backoff=False)
+        self.assertIsNone(dtek_http.cached_page())  # нові кукі — потрібен і новий токен

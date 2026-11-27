@@ -52,6 +52,7 @@ class Probe:
     attention: str | None = None  # вікно «Шановні клієнти!» з тієї ж сторінки
     failed: list[str] = field(default_factory=list)  # вулиці, по яких сайт нічого не дав
     streets: list[str] = field(default_factory=list)  # перелік вулиць м. Дніпро з поля «Введіть вулицю»
+    page_fetched: bool = True  # False — сторінку не тягнули (csrf з кешу): вікна «Шановні клієнти!» цього разу немає
 
 
 def classify(sub_type: str) -> str | None:
@@ -138,6 +139,14 @@ class _Session:
     async def __aenter__(self):
         from providers import extract_attention
 
+        if self.use_backoff:  # сервер: сторінку (~800 КБ) не тягнемо щоциклу — csrf під поточні кукі вже є
+            if dtek_http.backoff_left():
+                raise dtek_http.Backoff(f"пауза ще {int(dtek_http.backoff_left())} с")
+            await dtek_http.ensure_browser_session()
+            if cached := dtek_http.cached_page():
+                self.csrf, self.update = cached["csrf"], cached.get("update")
+                self.attention, self.streets, self.page_fetched = None, [], False
+                return self
         r = await dtek_http.request("GET", PAGE_URL, use_backoff=self.use_backoff)
         token = re.search(r'<meta[^>]+name="csrf-token"[^>]+content="([^"]+)"', r.text)
         if not token or "DisconSchedule" not in r.text:
@@ -150,6 +159,8 @@ class _Session:
         self.csrf = token.group(1)
         self.attention = extract_attention(r.text)
         self.streets = parse_streets(r.text)
+        self.page_fetched = True
+        dtek_http.remember_page(self.csrf, self.update)
         return self
 
     async def __aexit__(self, *exc):
@@ -197,7 +208,7 @@ async def probe(streets: list[str] | None = None, pause: tuple[float, float] | N
     lo, hi = pause or (DTEK_POLL_PAUSE_MIN, DTEK_POLL_PAUSE_MAX)
     out = Probe()
     async with _Session() as s:
-        out.attention, out.streets = s.attention, s.streets
+        out.attention, out.streets, out.page_fetched = s.attention, s.streets, s.page_fetched
         for i, street in enumerate(streets):
             if i:
                 await asyncio.sleep(lo + random.random() * max(hi - lo, 0))  # не пачкою і не рівним ритмом
