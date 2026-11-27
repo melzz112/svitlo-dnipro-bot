@@ -195,6 +195,13 @@ class DirectoryTests(DbCase):
             self.assertEqual((await db.find_house("вул. Березинська", "45"))["is_no_queue"], 1)
             self.assertEqual(await db.street_names(), ["вул. Березинська", "вул. Соколина"])
             self.assertEqual(await db.unpolled_streets(), ["вул. Соколина"])
+            self.assertEqual((await db.find_house("вул. Березинська", "43"))["ts"], 1700000000)  # старий час
+            seed = Path(self.tmp.name) / "seed.db"
+            with patch.object(db, "DB_PATH", str(seed)):
+                await db.init()
+                await db.save_houses("вул. Березинська", [("43", ["14.1"], ""), ("45", ["14.1"], "")])
+            _load_seed().import_from(str(seed), str(path))  # свіжий довідник перезаписує старий кеш
+            self.assertEqual((await db.find_house("вул. Березинська", "45"))["group_name"], "14.1")
             await db.init()  # повторний старт — нічого не ламає
 
 

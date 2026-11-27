@@ -130,7 +130,9 @@ async def _migrate_houses(db, rows: list[tuple] | None):
     for street, num, grps, cek, ts in rows or []:
         by_street.setdefault(street, []).append((num, [g for g in (grps or "").split(",") if g], cek or "", ts or 0))
     for street, houses in by_street.items():
-        await _save_houses(db, street, [h[:3] for h in houses], max(h[3] for h in houses) or None)
+        ts = max(h[3] for h in houses) or None
+        # старий кеш (черги лише 1.1–6.2) — з його ж часом, щоб свіжий довідник сідера його перезаписав
+        await _save_houses(db, street, [h[:3] for h in houses], ts, updated_at=ts or 1)
     await db.commit()
 
 
@@ -236,9 +238,9 @@ async def _street_id(db, name: str) -> int:
         return (await cur.fetchone())[0]
 
 
-async def _save_houses(db, street: str, houses, polled_at: int | None):
+async def _save_houses(db, street: str, houses, polled_at: int | None, updated_at: int | None = None):
     sid = await _street_id(db, street)
-    now = int(time.time())
+    now = int(updated_at or time.time())
     await db.executemany(
         "INSERT INTO dtek_houses(street_id, house_raw, house_norm, operator, group_name, is_no_queue, updated_at) "
         "VALUES(?,?,?,?,?,?,?) ON CONFLICT(street_id, house_norm) DO UPDATE SET house_raw=excluded.house_raw, "
