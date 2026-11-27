@@ -14,6 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 
 import db
+import directory_refresh
 import dtek_http
 import dtek_site
 import groups as G
@@ -78,7 +79,48 @@ def _stats_kb():
 
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Оновити", callback_data="adm:stats")
+    b.button(text="🗂 Довідник адрес", callback_data="adm:db")
+    b.adjust(1)
     return b.as_markup()
+
+
+async def _db_kb():
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+    st = await directory_refresh.state()
+    running = bool(st and st.get("running"))
+    b = InlineKeyboardBuilder()
+    if running:
+        other = "fast" if st.get("pace") == "slow" else "slow"
+        b.button(text="⏹ Зупинити", callback_data="adm:db:stop")
+        b.button(text=f"⏩ Темп: {directory_refresh.PACE_NAME[other]}", callback_data=f"adm:db:start:{other}")
+    else:
+        b.button(text="🔄 Оновити довідник (повільно, ~12 год)", callback_data="adm:db:start:slow")
+        b.button(text="🐇 Оновити швидше (~4 год)", callback_data="adm:db:start:fast")
+    b.button(text="↻ Статус", callback_data="adm:db")
+    b.adjust(1)
+    return b.as_markup()
+
+
+@router.message(Command("db"), F.from_user.id.in_(ADMIN_IDS))
+async def db_cmd(m: Message):
+    """Довідник адрес ДТЕК: стан і оновлення прямо на сервері (з телефона). Лише для адміна."""
+    await m.answer(await directory_refresh.report(), reply_markup=await _db_kb())
+
+
+@router.callback_query(F.data.startswith("adm:db"), F.from_user.id.in_(ADMIN_IDS))
+async def db_action(cb: CallbackQuery):
+    parts = cb.data.split(":")
+    if parts[2:3] == ["stop"]:
+        await directory_refresh.stop()
+    elif parts[2:3] == ["start"] and parts[3:4] and parts[3] in directory_refresh.PACES:
+        await directory_refresh.start(parts[3])
+    await edit(cb, await directory_refresh.report(), await _db_kb())
+
+
+@router.message(Command("db"))
+async def db_denied(m: Message):
+    log.warning("/db від чужого користувача %s", m.from_user.id if m.from_user else None)  # відповіді немає
 
 
 @router.message(Command("stats"), F.from_user.id.in_(ADMIN_IDS))

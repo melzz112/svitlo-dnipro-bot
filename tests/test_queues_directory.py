@@ -484,3 +484,70 @@ class PollSoonTests(DbCase):
         await handlers.addr_text(m, state)
         self.assertTrue(dtek_site.take_poll_soon())
         self.assertTrue(any("за хвилину буде" in t for t, _ in m.answers))
+
+
+class DirectoryRefreshTests(DbCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        import directory_refresh as dr
+        self.dr = dr
+        await db.upsert_streets(["вул. Березинська", "вул. Космічна", "вул. Робоча"])
+        await db.save_houses("вул. Березинська", [("43", ["1.2"], ""), ("45", [], "")])  # старий стан
+        await db.save_houses("вул. Космічна", [("7", ["14.1"], "")])
+        await db.save_houses("вул. Робоча", [("5", ["15.1"], "")])
+        self.site = {"вул. Березинська": {"43": dtek_house("14.1"), "45": dtek_house("14.1")},
+                     "вул. Космічна": {"7": dtek_house("14.1")}, "вул. Робоча": {"5": dtek_house("15.1")}}
+
+    def respond(self, method, url, form):
+        if method == "GET":
+            return 200, page(list(self.site))
+        self.asked.append(form["data[1][value]"])
+        return 200, {"result": True, "data": self.site[form["data[1][value]"]]}
+
+    async def test_full_refresh_with_pace_backoff_stop_and_summary(self):
+        self.asked, bot = [], AsyncMock()
+        with fake_dtek(self.respond), patch.object(self.dr, "ADMIN_IDS", [77]):
+            await self.dr.start("fast")
+            self.assertTrue(await self.dr.step(bot))
+            self.assertFalse(await self.dr.step(bot))  # темп: наступна вулиця — через 6 с
+            dtek_http.backoff("тест")
+            await db.kv_set(self.dr.KEY, json.dumps({**await self.dr.state(), "last": 0}))
+            self.assertFalse(await self.dr.step(bot))  # сайт на паузі — чекаємо
+            dtek_http.clear_backoff()
+            await self.dr.stop()
+            self.assertFalse(await self.dr.step(bot))
+            self.assertIn("зупинено на 1/3", await self.dr.report())
+            await self.dr.start("slow")  # продовжує, а не з нуля
+            for _ in range(3):
+                await db.kv_set(self.dr.KEY, json.dumps({**await self.dr.state(), "last": 0}))
+                await self.dr.step(bot)
+        self.assertEqual(sorted(self.asked), ["вул. Березинська", "вул. Космічна", "вул. Робоча"])  # кожна — раз
+        st = await self.dr.state()
+        self.assertEqual((st["running"], st["done"], st["failed"]), (False, 3, 0))
+        self.assertEqual((await db.find_house("вул. Березинська", "45"))["group_name"], "14.1")
+        uid, text = bot.send_message.await_args.args
+        self.assertEqual(uid, 77)
+        self.assertIn("Довідник адрес оновлено", text)
+        self.assertIn("1.2: 1 → 0 (-1)", text)
+        self.assertIn("14.1: 1 → 3 (+2)", text)
+        self.assertIn("без черги: 1 → 0 (-1)", text)
+        self.assertIn("Останнє оновлення", await self.dr.report())
+
+    async def test_admin_db_command(self):
+        import directory_refresh as dr
+        m = _Msg("/db")
+        await handlers.db_cmd(m)
+        text, markup = m.answers[0]
+        self.assertIn("Довідник адрес ДТЕК", text)
+        self.assertIn("Вулиць: 3", text)
+        buttons = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertIn("adm:db:start:slow", buttons)
+        cb = AsyncMock()
+        cb.data = "adm:db:start:fast"
+        cb.message.edit_text = AsyncMock()
+        await handlers.db_action(cb)
+        self.assertTrue((await dr.state())["running"])
+        self.assertIn("Оновлення йде", cb.message.edit_text.await_args.args[0])
+        cb.data = "adm:db:stop"
+        await handlers.db_action(cb)
+        self.assertFalse((await dr.state())["running"])

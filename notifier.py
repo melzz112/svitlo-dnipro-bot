@@ -10,6 +10,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError
 
 import db
+import directory_refresh
 import dtek_http
 import dtek_site
 import keyboards as kb
@@ -504,6 +505,7 @@ async def svitlobot_check(bot: Bot):
 
 async def loop(bot: Bot, every=60):
     """Сайт ДТЕК — раз на хвилину; аварії, «люди пишуть» і екстрені — кожні 15 с; графік — раз на хвилину."""
+    asyncio.create_task(directory_refresh.run(bot))  # оновлення довідника (/db) — своїм темпом
     n = 0
     while True:
         for job in (site_check, svitlobot_check, send_alerts, send_incidents, crowd_check, emergency_check) + (
