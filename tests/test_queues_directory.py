@@ -594,8 +594,9 @@ class PartialOutageWordingTests(DbCase):
     async def test_time_not_for_whole_group_when_only_part_of_addresses(self):
         G.register(NEW_QUEUES)
         text = await self._verdict_with(222, 575)
-        self.assertIn("Є світло, але не в усіх", text)
-        self.assertIn("офіційно — відключення лише на частині адрес групи", text)
+        self.assertIn("🟢 <b>Світло є, але не в усіх</b>", text)  # 39% адрес — не «у групи світла немає»
+        self.assertIn("екстрене лише на частині адрес групи", text)
+        self.assertNotIn("Світла немає", text)
         self.assertNotIn("офіційно — відключення до", text)
         self.assertIn("екстрене у 222 з 575 перевірених адрес групи, до", text)  # час — при адресах
 
@@ -811,3 +812,34 @@ class AckTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order, ["ack", "handler"])
         cb.answer.side_effect = RuntimeError("query is too old")
         await handlers._ack(cb)  # помилка відповіді не ламає обробку
+
+
+class ChatsVsSensorsTests(DbCase):
+    """«Нема» від кількох людей у чатах не робить «у всієї групи світла немає», якщо датчики бачать світло."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        G.register(NEW_QUEUES)
+        await db.set_user(1, grp="14.1", provider="dtek")
+        for i in range(4):
+            await db.add_chat_msg("chat", f"14.1 нема {i}", None, "off", ["14.1"], who=f"p{i}")
+
+    async def sensors(self, state):
+        await db.kv_set("svb:dtek:14.1", json.dumps({"state": state, "on": 12, "off": 1, "maint": 0,
+                                                     "ts": int(time.time()), "since": int(time.time())}))
+
+    async def test_sensors_on_means_part_of_group(self):
+        await self.sensors("on")
+        text = await _verdict("14.1")
+        self.assertIn("🟠 <b>Частина групи без світла</b>", text)
+        self.assertNotIn("🔴 <b>Світла немає</b>", text)
+        bot = AsyncMock()
+        with patch.object(notifier, "get_schedule", AsyncMock(return_value={"today": {"14.1": []}})),                 patch.object(status, "get_schedule", AsyncMock(return_value={"today": {"14.1": []}})):
+            await notifier.crowd_check(bot)
+        push = bot.send_message.await_args.args[1]
+        self.assertIn("у частини людей вимкнули світло", push)
+        self.assertIn("в більшості будинків групи світло є", push)
+
+    async def test_sensors_off_keeps_no_power(self):
+        await self.sensors("off")
+        self.assertIn("🔴 <b>Світла немає</b>", await _verdict("14.1"))

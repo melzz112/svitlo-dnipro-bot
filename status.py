@@ -69,7 +69,12 @@ async def emergency_today(grp: str, provider: str) -> str | None:
         "🚨 <b>Зараз діють екстрені відключення</b>",
         "Графік не діє — світло вимикають без графіка, за командами Укренерго.",
     ]
-    if alert:
+    if alert and await partial_outage(grp, provider, alert, None, now):
+        s = await _site_group(grp, now) or {}
+        lines += ["", f"🟠 Група <b>{grp}</b>: екстрене лише на частині адрес ({s.get('off')} з {s.get('total')})"]
+        if share := await _group_share(grp, now, "🏠 Сайт ДТЕК"):
+            lines.append(share)
+    elif alert:
         lines += ["", f"🔴 Група <b>{grp}</b> зараз без світла"]
         for icon in ("⏱", "🏠"):  # «з 13:16, орієнтовно до 17:16 20.11», «без світла 3 з 4 адрес»
             if m := re.search(icon + r" ([^\n]*)", alert["text"]):
@@ -135,13 +140,21 @@ async def official_outage(grp: str, provider: str, sch: dict | None = None, now:
     return alert, slot, (min(starts) if starts else None), until
 
 
+async def sensors_say_on(grp: str, provider: str) -> bool:
+    """Свіжий стан датчиків Світлобота групи — «є світло» (у більшості точок)."""
+    return (await svitlobot.group_state(provider, grp) or {}).get("state") == svitlobot.ON
+
+
+PARTIAL_SHARE = 2 / 3  # без світла менше 2/3 перевірених адрес групи — «частина групи», а не вся група
+
+
 async def partial_outage(grp: str, provider: str, alert: dict | None, slot, now: datetime | None = None) -> bool:
     """Офіційне відключення — лише на частині адрес групи (сайт ДТЕК: екстрене у 222 з 575), а не на всій:
     тоді його «до 00:00» — не час для всієї групи. За графіком чи з каналу (про всю групу) — False."""
     if provider != "dtek" or slot or (alert and alert.get("src") != "dteksite"):
         return False
     s = await _site_group(grp, now or datetime.now(TZ))
-    return bool(s and s.get("off") and s["off"] < s.get("total", 0))
+    return bool(s and s.get("off") and s["off"] < PARTIAL_SHARE * s.get("total", 0))
 
 
 async def _recent_end(grp: str, provider: str, sch: dict, now: datetime) -> float | None:
@@ -177,6 +190,8 @@ async def verdict(grp: str, provider: str) -> str:
         until = site_until
     today_slots = sch.get("today", {}).get(grp)
     note = None
+    # датчики Світлобота в будинках групи: «є світло» — головний аргумент проти «у всієї групи нема»
+    sensors_on = await sensors_say_on(grp, provider)
 
     if alert or slot:
         # 1) офіційно зараз відключення — голоси з його початку (від кожної людини — останній)
@@ -188,7 +203,14 @@ async def verdict(grp: str, provider: str) -> str:
         # хвилю «дали» зараз
         r_on, r_off = _recent_votes(people, now)
         till = f" до <b>{until}</b>" if until else ""
-        if (n_on >= ON_PARTIAL_MIN and n_on >= 2 * n_off) or (r_on >= ON_PARTIAL_MIN and r_on >= 2 * r_off):
+        if await partial_outage(grp, provider, alert, slot, now):
+            # сайт ДТЕК: екстрене лише на частині адрес групи (222 з 575) — це не «у групи світла немає»
+            if sensors_on or n_on > n_off or r_on > r_off:
+                head = "🟢 <b>Світло є, але не в усіх</b>"
+            else:
+                head = "🟠 <b>Частина групи без світла</b>"
+            sub = "екстрене лише на частині адрес групи" + (" · датчики бачать світло" if sensors_on else "")
+        elif (n_on >= ON_PARTIAL_MIN and n_on >= 2 * n_off) or (r_on >= ON_PARTIAL_MIN and r_on >= 2 * r_off):
             head, sub = "🟡 <b>Частково є світло</b>", "люди масово пишуть «дали» — почали вмикати, але не всім"
         elif (n_on >= 1 and n_on >= n_off) or (r_on >= 2 and r_on > r_off):
             head, sub = "🔴 <b>Світла немає</b>", "дехто пише, що дали — можливо, почали вмикати"
@@ -204,7 +226,11 @@ async def verdict(grp: str, provider: str) -> str:
         n_off = len(people) - n_on
         r_on, r_off = _recent_votes(people, now)
         till = ""
-        if city_em and n_off >= 2 and n_off > n_on:  # під час екстрених «нема» майже напевно правда
+        chats_off = (city_em and n_off >= 2 and n_off > n_on) or (n_off >= OFF_LOCAL_MIN and n_off > n_on)
+        if chats_off and sensors_on:
+            # кілька людей пишуть «нема», а датчики в будинках групи бачать світло — це частина групи, не вся
+            head, sub = "🟠 <b>Частина групи без світла</b>", "люди пишуть «нема», але датчики бачать світло в більшості"
+        elif city_em and n_off >= 2 and n_off > n_on:  # під час екстрених «нема» майже напевно правда
             head, sub = "🔴 <b>Світла немає</b>", "екстрені відключення · люди підтверджують"
         elif n_off >= OFF_LOCAL_MIN and n_off > n_on:
             head, sub = "🔴 <b>Світла немає</b>", "люди пишуть, хоча офіційно відключення немає — можливо, локальна аварія"
@@ -263,7 +289,7 @@ async def verdict(grp: str, provider: str) -> str:
             lines.append(incident_line(inc, now))  # аварія з часом ремонту на адресах групи (сайт ДТЕК / канали)
     if sensors := svitlobot.status_line(await svitlobot.group_state(provider, grp)):
         lines.append(sensors)  # фактичний стан за датчиками в будинках групи
-    if city_em and "кстрен" not in head + sub:  # у заголовку вже сказано про екстрені — не повторюємо
+    if city_em and "кстрені" not in head + sub:  # у заголовку вже сказано про екстрені — не повторюємо
         lines.append("🚨 У Дніпрі діють екстрені відключення — графік зараз не діє")
     if not city_em and not is_emergency_alert(alert) and (sched_line := _schedule_line(today_slots, slot, t)):
         lines.append(sched_line)

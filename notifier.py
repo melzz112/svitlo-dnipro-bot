@@ -284,6 +284,11 @@ async def crowd_check(bot: Bot):
                         head += "\n🟡 Поки не всім — офіційно відключення лише на частині адрес групи"
                     else:
                         head += "\n🟡 Поки не всім" + (f" — офіційно відключення до <b>{o_until}</b>" if o_until else "")
+            elif await status.sensors_say_on(grp, prov) or await status.partial_outage(grp, prov, o_alert, o_slot):
+                # датчики групи бачать світло / на сайті ДТЕК без світла лише частина адрес — не «вся група»
+                head, n = f"🕯 <b>Люди пишуть: {name} {grp} — у частини людей вимкнули світло</b>", n_off
+                if await status.sensors_say_on(grp, prov):
+                    head += "\n📡 За датчиками в більшості будинків групи світло є"
             elif emergency:
                 head, n = f"🚨 <b>{name} {grp}: вимкнули світло — екстрене відключення</b>", n_off
             else:
