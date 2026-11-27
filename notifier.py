@@ -11,13 +11,14 @@ from aiogram.exceptions import TelegramForbiddenError
 
 import db
 import directory_refresh
+import health
 import dtek_http
 import dtek_site
 import keyboards as kb
 import providers
 import status
 import svitlobot
-from config import (CITY, CROWD_MIN, DTEK_POLL_FAST_SEC, DTEK_POLL_INTERVAL_SEC, DTEK_STREETS, SOURCE, SVITLOBOT_ENABLED,
+from config import (CITY, CROWD_MIN, DIGEST_HOUR, QUIET_FROM, QUIET_TO, DTEK_POLL_FAST_SEC, DTEK_POLL_INTERVAL_SEC, DTEK_STREETS, SOURCE, SVITLOBOT_ENABLED,
                     SVITLOBOT_POLL_INTERVAL, TZ)
 from providers import get_schedule
 from render import day_text, hm, now_h, now_status
@@ -47,7 +48,21 @@ def _matches(alert_provider: str, user: dict) -> bool:
     return alert_provider == "*" or alert_provider == _prov(user)
 
 
-async def _send(bot: Bot, uid: int, text: str):
+def _quiet_hour(hour: int) -> bool:
+    return (hour >= QUIET_FROM or hour < QUIET_TO) if QUIET_FROM > QUIET_TO else QUIET_FROM <= hour < QUIET_TO
+
+
+async def in_quiet(uid: int) -> bool:
+    """Людина ввімкнула тихі години і зараз ніч (київський час)."""
+    u = await db.get_user(uid)
+    return bool(u.get("quiet")) and _quiet_hour(datetime.now(TZ).hour)
+
+
+async def _send(bot: Bot, uid: int, text: str, urgent: bool = False):
+    """urgent — аварія в самому будинку людини (і відповідь на її ж дію): іде й у тихі години."""
+    if not urgent and await in_quiet(uid):
+        await db.bump("quiet_skip")
+        return
     try:
         await bot.send_message(uid, text, reply_markup=kb.main_menu())
         await db.bump("push")
@@ -415,18 +430,20 @@ async def site_check(bot: Bot):
     except dtek_http.ERRORS as e:
         await _set_next(time.monotonic() + max(dtek_http.backoff_left(), DTEK_POLL_INTERVAL_SEC))
         log.warning("сайт ДТЕК: перевірка адрес не вдалась: %r", e)
+        await health.mark("dtek", False, repr(e))
         await db.kv_set("site_probe", json.dumps({"ok": False, "ts": int(time.time()), "err": str(e)[:80]}, ensure_ascii=False))
         return
     await db.kv_set("site_probe", json.dumps({"ok": True, "ts": int(time.time()), "houses": len(probe.houses)}))
+    await health.mark("dtek", True)
     if probe.page_fetched:  # сторінку тягнули (раз на ~20 хв) — заодно свіже вікно «Шановні клієнти!»
         providers.set_notice("dtek", probe.attention)
     for u, street, h in dtek_site.resolve_pending(probe, pending, cands):
-        await _send(bot, u["id"], await _finish_address(u, street, h))
+        await _send(bot, u["id"], await _finish_address(u, street, h), urgent=True)
         await asyncio.sleep(0.05)
     for change in await dtek_site.apply(probe):
         log.info("сайт ДТЕК: %s", change)
     for uid, text in await dtek_site.apply_users(probe, addr_users):
-        await _send(bot, uid, text)
+        await _send(bot, uid, text, urgent=True)  # будинок людини — і вночі
         await asyncio.sleep(0.05)
     if n := await dtek_site.record_incidents(probe.houses):
         log.info("сайт ДТЕК: нових аварій по чергах: %d", n)
@@ -518,8 +535,10 @@ async def svitlobot_check(bot: Bot):
         pause = e.retry_after or min(SVITLOBOT_POLL_INTERVAL * 2 ** _svb_fails, 3600)
         _svb_next = time.monotonic() + pause
         log.warning("світлобот: %s — наступна спроба за %d с", e, pause)
+        await health.mark("svitlobot", False, str(e))
         return
     _svb_fails = 0
+    await health.mark("svitlobot", True)
     changes = await svitlobot.apply(points)
     if not changes:
         return
@@ -539,12 +558,48 @@ async def svitlobot_check(bot: Bot):
                 await asyncio.sleep(0.05)
 
 
+async def digest_text(u: dict) -> str:
+    """☀️ Ранкове зведення: будинок (сайт ДТЕК), графік на сьогодні, екстрені й аварії по черзі."""
+    prov, grp = _prov(u), u.get("grp")
+    name = db.PROVIDER_NAME[prov]
+    lines = ["☀️ <b>Доброго ранку!</b>"]
+    if house := await status.house_block(u):
+        lines += ["", house]
+    if grp:
+        days = await providers.get_schedule_days(prov)
+        lines += ["", f"🏢 {name}\n" + day_text(grp, days["today"].groups.get(grp), "Сьогодні")]
+        now = datetime.now(TZ)
+        for inc in (await db.active_incidents(prov, grp, int(now.timestamp())))[:2]:
+            lines.append(status.incident_line(inc, now))
+    if await db.get_emergency(prov):
+        lines += ["", "🚨 У Дніпрі діють екстрені відключення — графік може не діяти"]
+    return "\n".join(lines)
+
+
+async def morning_digest(bot: Bot):
+    """Раз на день о DIGEST_HOUR — тим, хто ввімкнув «☀️ Зведення»."""
+    now = datetime.now(TZ)
+    if now.hour != DIGEST_HOUR or await db.kv_get(f"digest_day:{now:%Y-%m-%d}"):
+        return
+    await db.kv_set(f"digest_day:{now:%Y-%m-%d}", "1")
+    users = await db._all("SELECT * FROM users WHERE digest=1 AND notify_on=1")
+    for u in users:
+        try:
+            await _send(bot, u["id"], await digest_text(u), urgent=True)
+        except Exception:
+            log.exception("зведення %s", u["id"])
+        await asyncio.sleep(0.05)
+    if users:
+        log.info("ранкове зведення: %d людей", len(users))
+
+
 async def loop(bot: Bot, every=60):
     """Сайт ДТЕК — раз на хвилину; аварії, «люди пишуть» і екстрені — кожні 15 с; графік — раз на хвилину."""
     asyncio.create_task(directory_refresh.run(bot))  # оновлення довідника (/db) — своїм темпом
     n = 0
     while True:
-        for job in (site_check, svitlobot_check, send_alerts, send_incidents, crowd_check, emergency_check) + (
+        for job in (site_check, svitlobot_check, send_alerts, send_incidents, crowd_check, emergency_check,
+                    health.check, morning_digest) + (
                 (tick,) if n % 4 == 0 else ()):
             try:
                 await job(bot)

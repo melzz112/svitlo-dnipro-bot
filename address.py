@@ -82,6 +82,26 @@ def match_street(query: str, streets: list[str]) -> str | None:
     return cores[close[0]] if close else None
 
 
+def street_options(query: str, streets: list[str], limit: int = 6) -> list[str]:
+    """Варіанти вулиць ДТЕК для неточної назви — кнопками людині. «Шевченка» -> вул. / пров. Шевченка;
+    «шевч» -> усе, де є слово, що так починається; одруківка -> найближчі за написанням."""
+    q_tokens = _core_tokens(query)
+    q_type = street_type(query)
+    if not q_tokens:
+        return []
+
+    def has_all(s: str) -> bool:
+        tokens = _core_tokens(s)
+        return all(any(t.startswith(q) for t in tokens) for q in q_tokens)
+
+    found = [s for s in streets if has_all(s)]
+    if not found:
+        cores = {street_core(s): s for s in streets}
+        found = [cores[c] for c in difflib.get_close_matches(street_core(query), list(cores), n=limit, cutoff=0.75)]
+        return found[:limit]
+    return sorted(found, key=lambda s: (street_type(s) != q_type, len(s), s))[:limit]
+
+
 def guess_dtek_names(query: str) -> list[str]:
     """Коли переліку вулиць ДТЕК немає: «Соколина вулиця» -> ["вул. Соколина"]; без типу — кілька варіантів."""
     words = _TYPE_RE.sub(" ", _norm_text(query)).split()

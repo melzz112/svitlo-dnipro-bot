@@ -22,6 +22,22 @@ class Report(CallbackData, prefix="rep"):
     status: str  # on | off
 
 
+class StreetPick(CallbackData, prefix="st"):
+    i: int  # номер варіанта (назви — у стані FSM, у кнопку довга назва не влазить)
+
+
+def street_pick_kb(options: list[str]):
+    b = InlineKeyboardBuilder()
+    for i, name in enumerate(options):
+        b.button(text=name[:60], callback_data=StreetPick(i=i))
+    b.adjust(1)
+    return b.as_markup()
+
+
+class Toggle(CallbackData, prefix="tgl"):
+    what: str  # quiet | digest
+
+
 class Notify(CallbackData, prefix="ntf"):
     value: int  # 0 = вимк/увімк, інакше хвилини
 
@@ -116,7 +132,13 @@ def settings_kb(user: dict):
     for m in (5, 15, 30, 60):
         mark = "✅ " if user["notify_min"] == m else ""
         b.button(text=f"{mark}{m} хв", callback_data=Notify(value=m))
-    rows = [1, 1, 4]
+    from config import DIGEST_HOUR, QUIET_FROM, QUIET_TO
+
+    b.button(text=f"🌙 Тихі години {QUIET_FROM:02d}–{QUIET_TO:02d}: {'увімк' if user.get('quiet') else 'вимк'}",
+             callback_data=Toggle(what="quiet"))
+    b.button(text=f"☀️ Зведення о {DIGEST_HOUR:02d}:00: {'увімк' if user.get('digest') else 'вимк'}",
+             callback_data=Toggle(what="digest"))
+    rows = [1, 1, 4, 1, 1]
     if user.get("street") and user.get("house"):
         b.button(text=f"📍 {user['street']}, {user['house']}"[:60], callback_data=Nav(to="addr"))
         b.button(text="🗑 Видалити адресу", callback_data=Nav(to="addr_del"))

@@ -11,7 +11,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
+from aiogram.types import CallbackQuery, InlineQuery, Message, ReplyKeyboardRemove
 
 import db
 import directory_refresh
@@ -20,7 +20,7 @@ import dtek_site
 import groups as G
 import keyboards as kb
 import stats
-from address import norm_house, parse_text_address, reverse_geocode
+from address import norm_house, parse_text_address, reverse_geocode, street_options
 from parse import clean_chat_text
 from providers import get_schedule_days
 from config import ADMIN_IDS, TZ
@@ -30,6 +30,21 @@ from status import emergency_today, house_block, verdict
 log = logging.getLogger(__name__)
 
 router = Router()
+
+
+@router.callback_query.outer_middleware()
+async def ack_early(handler, event: CallbackQuery, data):
+    """Відповідаємо на натискання одразу: Telegram чекає ≤15 с, а «Зараз» / «Графік» буває довше (YASNO, сайт).
+    Без цього — «query is too old» у логах і «годинник» на кнопці."""
+    await _ack(event)
+    return await handler(event, data)
+
+
+async def _ack(cb: CallbackQuery):
+    try:
+        await cb.answer()
+    except Exception:  # уже відповіли / застаріло — не важливо
+        pass
 
 MENU_TEXT = "⚡ <b>Світло Дніпро</b>\n{prov} · група <b>{grp}</b>\n\nОбери, що показати:"
 PICK_TEXT = (
@@ -67,7 +82,7 @@ async def edit(cb: CallbackQuery, text: str, markup):
     except TelegramBadRequest as e:
         if "not modified" not in str(e):
             raise
-    await cb.answer()
+    await _ack(cb)
 
 
 def _is_admin(user) -> bool:
@@ -160,7 +175,7 @@ async def set_provider(cb: CallbackQuery, callback_data: kb.SetProvider):
 @router.callback_query(kb.SetGroup.filter())
 async def set_group(cb: CallbackQuery, callback_data: kb.SetGroup):
     if not G.is_group(callback_data.code):  # підроблена кнопка — ігноруємо
-        await cb.answer()
+        await _ack(cb)
         return
     G.register([callback_data.code])
     await db.set_user(cb.from_user.id, grp=callback_data.code)
@@ -303,12 +318,21 @@ async def notify(cb: CallbackQuery, callback_data: kb.Notify):
     await edit(cb, SETTINGS_TEXT, kb.settings_kb(await db.get_user(cb.from_user.id)))
 
 
+@router.callback_query(kb.Toggle.filter(F.what.in_({"quiet", "digest"})))
+async def toggle(cb: CallbackQuery, callback_data: kb.Toggle):
+    """🌙 тихі години (вночі — лише аварія в самому будинку) і ☀️ ранкове зведення."""
+    u = await db.get_user(cb.from_user.id)
+    await db.set_user(cb.from_user.id, **{callback_data.what: 0 if u.get(callback_data.what) else 1})
+    await edit(cb, SETTINGS_TEXT, kb.settings_kb(await db.get_user(cb.from_user.id)))
+
+
 # ---------- адреса: геопозиція або текст -> будинок на сайті ДТЕК -> група і точні пуші ----------
 
 
 class Addr(StatesGroup):
     waiting = State()  # чекаємо геопозицію або адресу текстом
     house = State()  # вулицю знаємо, чекаємо номер будинку
+    pick = State()  # кілька схожих вулиць — людина обирає кнопкою
 
 
 ADDR_TEXT = (
@@ -326,7 +350,7 @@ ADDR_TEXT = (
 async def addr_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(Addr.waiting)
     await cb.message.answer(ADDR_TEXT, reply_markup=kb.location_kb())
-    await cb.answer()
+    await _ack(cb)
 
 
 @router.callback_query(kb.Nav.filter(F.to == "addr_del"))
@@ -393,9 +417,10 @@ async def addr_house(m: Message, state: FSMContext):
 GRP_NONE_LINE = "🏢 ДТЕК · у цього будинку на сайті ДТЕК черги немає — стежу за самим будинком"
 
 
-async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str):
+async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str, uid: int | None = None):
     """Спершу довідник (dtek_streets / dtek_houses) — 0 запитів до сайту. Сайт ДТЕК — лише якщо будинку в
     довіднику немає і сайт не на паузі (після відмови — DTEK_BACKOFF_SEC тиші)."""
+    uid = uid or m.from_user.id
     res = await dtek_site.lookup_cached(street_q, house)
     local = bool(res and res.house)
     if not local and not await dtek_site.site_blocked():
@@ -412,15 +437,21 @@ async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str
         if cands:
             await state.clear()
             num = norm_house(house)
-            await db.set_user(m.from_user.id, addr_q=f"{street_q}|{num}")
+            await db.set_user(uid, addr_q=f"{street_q}|{num}")
             await m.answer(
                 f"⏳ Сайт ДТЕК зараз не пускає бота. Адресу <b>{escape(cands[0])}, {escape(num)}</b> я запам'ятав: "
                 "щойно сайт відповість, сам знайду будинок, поставлю групу і напишу тобі.\n\n"
                 "Поки що можеш обрати групу вручну 👇", reply_markup=ReplyKeyboardRemove())
-            u = await db.get_user(m.from_user.id)
+            u = await db.get_user(uid)
             await m.answer(PICK_TEXT.format(prov=_pname(u)), reply_markup=kb.groups_kb(u["grp"], _prov(u)))
             return
         res = dtek_site.Lookup()  # вулиці немає в переліку ДТЕК — нижче попросимо перевірити назву
+    if not res.street and (opts := street_options(street_q, await db.street_names())):
+        await state.update_data(opts=opts, house=house)  # «Шевченка» -> вул. / пров.; одруківка -> схожі
+        await state.set_state(Addr.pick)
+        await m.answer(f"Яку вулицю маєш на увазі? Будинок <b>{escape(norm_house(house))}</b>:",
+                       reply_markup=kb.street_pick_kb(opts))
+        return
     if not res.street:
         await m.answer(f"Не знайшов вулицю «{escape(street_q)}» у переліку ДТЕК. Перевір назву й напиши ще раз "
                        "(напр. <i>просп. Яворницького 3</i>). Якщо ти абонент ЦЕК — натисни «❌ Скасувати» "
@@ -428,40 +459,40 @@ async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str
         await state.set_state(Addr.waiting)
         return
     await state.clear()
-    await db.set_user(m.from_user.id, addr_q="")  # адресу знайшли — більше не чекаємо сайт
+    await db.set_user(uid, addr_q="")  # адресу знайшли — більше не чекаємо сайт
     if not res.house:
         await m.answer(
             f"Вулицю знайшов (<b>{escape(res.street)}</b>), але будинку <b>{escape(house)}</b> немає в даних ДТЕК.\n"
             "Якщо номер правильний — схоже, твій будинок обслуговує <b>ЦЕК</b>. Обери постачальника й групу вручну "
             "(вони є в рахунку за світло).", reply_markup=ReplyKeyboardRemove(),
         )
-        u = await db.get_user(m.from_user.id)
+        u = await db.get_user(uid)
         await m.answer(PICK_TEXT.format(prov="ЦЕК"), reply_markup=kb.groups_kb(u["grp"], "cek"))
         return
     h = res.house
     if h.cek:  # сайт ДТЕК позначив будинок як ЦЕК
         cek_grp = dtek_site.cek_group(h)
         if cek_grp:
-            await db.set_user(m.from_user.id, provider="cek", grp=cek_grp, street="", house="")
+            await db.set_user(uid, provider="cek", grp=cek_grp, street="", house="")
             await m.answer(
                 f"🏠 {escape(res.street)}, {escape(h.num)}\nЗа даними сайту ДТЕК твій будинок обслуговує <b>ЦЕК</b> · "
                 f"група <b>{cek_grp}</b>. Поставив ЦЕК {cek_grp}.\n\nℹ️ Сповіщень саме по будинку для ЦЕК поки немає — "
                 "лише графік, аварії з каналів і те, що пишуть люди.", reply_markup=ReplyKeyboardRemove())
-            await m.answer(_menu_text(await db.get_user(m.from_user.id)), reply_markup=kb.main_menu())
+            await m.answer(_menu_text(await db.get_user(uid)), reply_markup=kb.main_menu())
         else:
             await m.answer(
                 f"🏠 {escape(res.street)}, {escape(h.num)}\nЗа даними сайту ДТЕК твій будинок обслуговує <b>ЦЕК</b>. "
                 "Обери групу ЦЕК вручну (є в рахунку за світло).", reply_markup=ReplyKeyboardRemove())
-            u = await db.get_user(m.from_user.id)
+            u = await db.get_user(uid)
             await m.answer(PICK_TEXT.format(prov="ЦЕК"), reply_markup=kb.groups_kb(u["grp"], "cek"))
         return
     grp = h.groups[0] if h.groups else None
     # будинок без черги — групу прибираємо: стежимо саме за будинком (за ним опитуємо його вулицю)
-    await db.set_user(m.from_user.id, street=res.street, house=h.num, provider="dtek", grp=grp)
+    await db.set_user(uid, street=res.street, house=h.num, provider="dtek", grp=grp)
     grp_line = f"🏢 ДТЕК · група <b>{grp}</b>" if grp else GRP_NONE_LINE
     if local:  # з довідника — черга відома, а чи є зараз світло, покаже найближча перевірка сайту
-        await db.kv_set(f"house:{m.from_user.id}", "")
-        await db.kv_set(f"house_seen:{m.from_user.id}", "")
+        await db.kv_set(f"house:{uid}", "")
+        await db.kv_set(f"house_seen:{uid}", "")
         wait = ("⏳ Сайт ДТЕК зараз не пускає бота — чи є світло в будинку, перевірю, щойно він відповість."
                 if await dtek_site.site_blocked() else
                 "ℹ️ Чи є зараз світло в будинку — перевіряю на сайті ДТЕК, за хвилину буде в «⚡ Зараз».")
@@ -473,14 +504,14 @@ async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str
             "Далі я стежу за твоїм будинком на сайті ДТЕК і напишу, щойно буде аварія, продовження чи світло повернеться.",
             reply_markup=ReplyKeyboardRemove(),
         )
-        await m.answer(_menu_text(await db.get_user(m.from_user.id)), reply_markup=kb.main_menu())
+        await m.answer(_menu_text(await db.get_user(uid)), reply_markup=kb.main_menu())
         return
     # одразу запам'ятовуємо поточний стан, щоб перша ж перевірка не дублювала те, що людина бачить зараз
-    await db.kv_set(f"house_seen:{m.from_user.id}", json.dumps(
+    await db.kv_set(f"house_seen:{uid}", json.dumps(
         {"kind": h.kind, "reason": dtek_site.reason(h) if h.kind else "", "start": h.start, "end": h.end,
          "ts": int(time.time()), "groups": h.groups, "street": res.street, "num": h.num}, ensure_ascii=False))
     off = bool(h.kind) and h.kind != "schedule"
-    await db.kv_set(f"house:{m.from_user.id}", json.dumps({"start": h.start, "end": h.end, "miss": 0}) if off else "")
+    await db.kv_set(f"house:{uid}", json.dumps({"start": h.start, "end": h.end, "miss": 0}) if off else "")
     if off:
         now_line = f"🔴 Зараз: {dtek_site.reason(h)}" + (f" до <b>{dtek_site.short_dt(h.end)}</b>" if h.end else "")
     elif h.kind == "schedule":
@@ -493,4 +524,63 @@ async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str
         "продовження чи світло повернеться.",
         reply_markup=ReplyKeyboardRemove(),
     )
-    await m.answer(_menu_text(await db.get_user(m.from_user.id)), reply_markup=kb.main_menu())
+    await m.answer(_menu_text(await db.get_user(uid)), reply_markup=kb.main_menu())
+
+
+@router.callback_query(kb.StreetPick.filter())
+async def addr_pick(cb: CallbackQuery, callback_data: kb.StreetPick, state: FSMContext):
+    """Людина обрала вулицю з підказок -> шукаємо той самий будинок уже на ній."""
+    data = await state.get_data()
+    opts, house = data.get("opts") or [], data.get("house") or ""
+    if not (0 <= callback_data.i < len(opts)) or not house:
+        await cb.message.answer("Підказка застаріла — напиши адресу ще раз, напр. <i>Яворницького 3</i>.")
+        await state.set_state(Addr.waiting)
+        return
+    await _addr_resolve(cb.message, state, opts[callback_data.i], house, uid=cb.from_user.id)
+
+
+@router.message(Addr.pick, F.text)
+async def addr_pick_text(m: Message, state: FSMContext):
+    """Замість кнопки людина написала адресу заново."""
+    await state.set_state(Addr.waiting)
+    await addr_text(m, state)
+
+
+# ---------- inline: «@бот Микитинська 14» у будь-якому чаті -> черга будинку з довідника ----------
+
+def _inline_house(street: str, h: dict) -> tuple[str, str]:
+    if h["operator"] == "cek":
+        what = f"ЦЕК · черга {h['group_name']}" if h["group_name"] else "ЦЕК"
+    elif h["group_name"]:
+        what = f"ДТЕК · черга {h['group_name']}"
+    else:
+        what = "ДТЕК · без черги"
+    return f"{street}, {h['num']} — {what}", what
+
+
+@router.inline_query()
+async def inline_lookup(q: InlineQuery):
+    from aiogram.types import InlineQueryResultArticle, InlineQueryResultsButton, InputTextMessageContent
+
+    text = (q.query or "").strip()
+    button = InlineQueryResultsButton(text="⚡ Сповіщення по своєму будинку — у боті", start_parameter="inline")
+    street_q, house = parse_text_address(text) if len(text) >= 3 else ("", None)
+    results = []
+    if street_q and house:
+        names = await db.street_names()
+        best = await dtek_site.street_candidates(street_q)
+        for name in list(dict.fromkeys(best + street_options(street_q, names, limit=5)))[:5]:
+            if h := await db.find_house(name, house):
+                title, what = _inline_house(name, h)
+                results.append(InlineQueryResultArticle(
+                    id=str(len(results)), title=title, description="Довідник адрес сайту ДТЕК",
+                    input_message_content=InputTextMessageContent(
+                        message_text=f"🏠 <b>{escape(name)}, {escape(h['num'])}</b>\n⚡ {what}",
+                        parse_mode="HTML")))
+    if not results:
+        hint = ("Напиши вулицю і номер будинку, напр. Микитинська 14" if not house
+                else f"Не знайшов «{text}» у довіднику ДТЕК — перевір назву")
+        results.append(InlineQueryResultArticle(
+            id="hint", title=hint, description="Черга відключень за адресою (Дніпро)",
+            input_message_content=InputTextMessageContent(message_text=f"🔎 {escape(hint)}", parse_mode="HTML")))
+    await q.answer(results, cache_time=300, is_personal=False, button=button)

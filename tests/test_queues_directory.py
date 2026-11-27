@@ -662,3 +662,152 @@ class OffLockTests(DbCase):
         await db.add_alert("site-on", "on", "14.1", None, "✅ Група 14.1: екстрене закінчилось", "dtek", "dteksite")
         await notifier.send_alerts(AsyncMock())
         self.assertFalse(await notifier.off_locked("dtek", "14.1"))
+
+
+class SvitlobotDirectoryTests(DbCase):
+    async def test_point_group_comes_from_directory(self):
+        import svitlobot as svb
+        from test_svitlobot import row
+
+        await db.upsert_streets(["вул. Калинова"])
+        await db.save_houses("вул. Калинова", [("82", ["17.1"], ""), ("84", [], "")])
+        raw = "\n".join([
+            row(1, 1),  # підпис «Група 1.2», але за довідником будинок у 17.1
+            row(2, 1, addr="Дніпро -> Невідома 5"),  # адреси в довіднику немає — лишається підпис 1.2
+            row(3, 2, addr="Дніпро -> вул. Калинова 82 (п.1-3)", extra=""),  # без підпису — з довідника
+            row(4, 1, addr="Дніпро -> Калинова 84"),  # будинок без черги — у групах не рахуємо
+            row(5, 1, addr="Київ -> Калинова 82"),  # інше місто
+        ])
+        with patch.object(svb, "_dir_ts", 0.0):
+            pts = await svb.resolve_points(raw, mapping={})
+        self.assertEqual([(p.id, p.provider, p.grp) for p in pts],
+                         [("1", "dtek", "17.1"), ("2", "dtek", "1.2"), ("3", "dtek", "17.1")])
+
+
+class HealthTests(DbCase):
+    async def test_admin_alert_after_30_min_and_recovery(self):
+        import health
+        bot = AsyncMock()
+        with patch.object(health, "ADMIN_IDS", [77]):
+            await health.mark("yasno", False, "ConnectTimeout")
+            await health.check(bot)
+            self.assertEqual(bot.send_message.await_count, 0)  # ще не 30 хв
+            st = await health.get("yasno")
+            await db.kv_set("health:yasno", json.dumps({**st, "down_since": int(time.time()) - 31 * 60}))
+            await health.mark("yasno", False, "ConnectTimeout")  # повторна помилка — не новий збій
+            await health.check(bot)
+            await health.check(bot)
+            self.assertEqual(bot.send_message.await_count, 1)
+            self.assertIn("YASNO (графіки)</b> недоступне", bot.send_message.await_args.args[1])
+            await health.mark("yasno", True)
+            await health.check(bot)
+            self.assertIn("знову працює (не було", bot.send_message.await_args.args[1])
+            await health.check(bot)
+            self.assertEqual(bot.send_message.await_count, 2)
+
+
+class StreetOptionsTests(unittest.TestCase):
+    def test_options(self):
+        import address
+        streets = ["вул. Шевченка", "пров. Шевченка", "вул. Березинська", "просп. Дмитра Яворницького",
+                   "вул. Шевчука"]
+        self.assertEqual(address.street_options("Шевченка", streets), ["вул. Шевченка", "пров. Шевченка"])
+        self.assertEqual(address.street_options("шевч", streets), ["вул. Шевчука", "вул. Шевченка", "пров. Шевченка"])
+        self.assertEqual(address.street_options("Березинськая", streets), ["вул. Березинська"])
+        self.assertEqual(address.street_options("Хрещатик", streets), [])
+
+
+class StreetPickDialogTests(DbCase):
+    async def test_ambiguous_street_buttons(self):
+        await db.upsert_streets(["вул. Шевченка", "пров. Шевченка", "вул. Шевчука"])
+        await db.save_houses("пров. Шевченка", [("5", ["16.1"], "")])
+        await db.set_user(1)
+        state = FSMContext(storage=MemoryStorage(), key=StorageKey(bot_id=1, chat_id=1, user_id=1))
+        await state.set_state(handlers.Addr.waiting)
+        m = _Msg("шевч 5")
+        with patch.object(dtek_site, "site_blocked", AsyncMock(return_value=True)):
+            await handlers.addr_text(m, state)
+        text, markup = m.answers[-1]
+        self.assertIn("Яку вулицю маєш на увазі", text)
+        names = [b.text for row in markup.inline_keyboard for b in row]
+        self.assertIn("пров. Шевченка", names)
+        cb = AsyncMock()
+        cb.from_user.id = 1
+        cb.message = _Msg("")
+        await handlers.addr_pick(cb, kb.StreetPick(i=names.index("пров. Шевченка")), state)
+        u = await db.get_user(1)
+        self.assertEqual((u["street"], u["house"], u["grp"]), ("пров. Шевченка", "5", "16.1"))
+
+
+class InlineTests(DbCase):
+    async def test_inline_lookup_from_directory(self):
+        await db.upsert_streets(["вул. Микитинська", "вул. Березинська"])
+        await db.save_houses("вул. Микитинська", [("14", ["14.1"], ""), ("16", [], "")])
+        q = AsyncMock()
+        q.query = "Микитинська 14"
+        with fake_dtek(lambda *a: (500, "")) as s:
+            await handlers.inline_lookup(q)
+            self.assertEqual(s.calls, [])  # лише довідник
+        results = q.answer.await_args.args[0]
+        self.assertEqual(results[0].title, "вул. Микитинська, 14 — ДТЕК · черга 14.1")
+        self.assertIn("черга 14.1", results[0].input_message_content.message_text)
+        q.query = "Микитинська 16"
+        await handlers.inline_lookup(q)
+        self.assertIn("без черги", q.answer.await_args.args[0][0].title)
+        q.query = "Неіснуюча 1"
+        await handlers.inline_lookup(q)
+        self.assertEqual(q.answer.await_args.args[0][0].id, "hint")
+
+
+class QuietDigestTests(DbCase):
+    async def test_quiet_hours_only_urgent(self):
+        await db.set_user(1, grp="14.1", provider="dtek", quiet=1)
+        bot = AsyncMock()
+        night = datetime(2026, 11, 27, 2, 0, tzinfo=TZ)
+        with patch.object(notifier, "datetime", wraps=datetime) as dt:
+            dt.now.return_value = night
+            await notifier._send(bot, 1, "графік оновився")
+            await notifier._send(bot, 1, "🏠 у твоєму будинку немає світла", urgent=True)
+            dt.now.return_value = night.replace(hour=9)
+            await notifier._send(bot, 1, "графік оновився")
+        self.assertEqual([c.args[1] for c in bot.send_message.await_args_list],
+                         ["🏠 у твоєму будинку немає світла", "графік оновився"])
+
+    async def test_morning_digest_once(self):
+        await db.set_user(1, grp="14.1", provider="dtek", digest=1, street="вул. Микитинська", house="14")
+        await db.set_user(2, grp="14.1", provider="dtek")
+        bot = AsyncMock()
+        days = {"today": DaySchedule({"14.1": [Slot(10, 12)]}, "yasno"), "tomorrow": DaySchedule()}
+        morning = datetime.now(TZ).replace(hour=notifier.DIGEST_HOUR, minute=3)
+        with patch.object(notifier, "datetime", wraps=datetime) as dt, \
+                patch.object(providers, "get_schedule_days", AsyncMock(return_value=days)):
+            dt.now.return_value = morning
+            await notifier.morning_digest(bot)
+            await notifier.morning_digest(bot)
+        self.assertEqual(bot.send_message.await_count, 1)
+        uid, text = bot.send_message.await_args.args
+        self.assertEqual(uid, 1)
+        self.assertIn("Доброго ранку", text)
+        self.assertIn("Твій будинок", text)
+        self.assertIn("10:00", text)
+
+    def test_settings_buttons(self):
+        markup = kb.settings_kb({"grp": "14.1", "notify_on": 1, "notify_min": 15, "quiet": 1, "digest": 0})
+        texts = [b.text for row in markup.inline_keyboard for b in row]
+        self.assertTrue(any(t.startswith("🌙 Тихі години") and t.endswith("увімк") for t in texts))
+        self.assertTrue(any(t.startswith("☀️ Зведення") and t.endswith("вимк") for t in texts))
+
+
+class AckTests(unittest.IsolatedAsyncioTestCase):
+    async def test_callback_answered_before_handler(self):
+        order = []
+        cb = AsyncMock()
+        cb.answer.side_effect = lambda *a, **k: order.append("ack")
+
+        async def handler(event, data):
+            order.append("handler")
+
+        await handlers.ack_early(handler, cb, {})
+        self.assertEqual(order, ["ack", "handler"])
+        cb.answer.side_effect = RuntimeError("query is too old")
+        await handlers._ack(cb)  # помилка відповіді не ламає обробку

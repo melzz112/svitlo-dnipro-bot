@@ -20,7 +20,10 @@ def _list(name):
 CHANNELS = _list("CHANNELS")  # канали-агрегатори: пости -> сповіщення; їх коментарі -> звіти людей
 CHATS = _list("CHATS")  # додаткові чати, де пишуть люди
 ADMIN_IDS = [int(x) for x in _list("ADMIN_IDS") if x.lstrip("-").isdigit()]  # Telegram ID тих, кому доступна /stats
-CROWD_MIN = int(os.getenv("CROWD_MIN") or 3)  # скільки різних людей за 15 хв = «люди пишуть, що дали»
+CROWD_MIN = int(os.getenv("CROWD_MIN") or 3)
+QUIET_FROM = int(os.getenv("QUIET_FROM") or 23)  # тихі години (київський час), якщо людина їх увімкнула
+QUIET_TO = int(os.getenv("QUIET_TO") or 7)
+DIGEST_HOUR = int(os.getenv("DIGEST_HOUR") or 7)  # ранкове зведення  # скільки різних людей за 15 хв = «люди пишуть, що дали»
 
 from groups import DEFAULT as GROUPS  # noqa: E402 — типові 1.1 … 6.2; реальні черги (до 18.1+) — groups.known()
 
