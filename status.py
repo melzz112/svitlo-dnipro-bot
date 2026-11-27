@@ -13,7 +13,7 @@ from html import escape
 
 import db
 import svitlobot
-from config import TZ
+from config import DTEK_POLL_INTERVAL_SEC, TZ
 from providers import get_schedule
 from render import hm, now_h
 
@@ -200,7 +200,7 @@ async def verdict(grp: str, provider: str) -> str:
         elif n_off >= OFF_LOCAL_MIN and n_off > n_on:
             head, sub = "🔴 <b>Світла немає</b>", "люди пишуть, хоча офіційно відключення немає — можливо, локальна аварія"
         elif city_em:
-            head, sub = "🟠 <b>Екстрені відключення</b>", "світло можуть вимкнути будь-якої миті"
+            head, sub = "🟠 <b>Екстрені відключення</b>", "графік зараз не діє — світло можуть вимкнути будь-якої миті"
         elif end_ts:
             head, sub = "🟢 <b>Світло є</b>", f"відключення скінчилось о {_hm_ts(end_ts)}"
         elif today_slots is None and not people:
@@ -246,18 +246,24 @@ async def verdict(grp: str, provider: str) -> str:
         lines.append(f"🚨 Офіційно ({src}): {_label(alert['text'])}{till}")
         if alert.get("src") == "dteksite" and (m := re.search(r"🏠 ([^\n]*)", alert["text"])):
             lines.append(f"🏠 {m.group(1)} (сайт ДТЕК)")
-    for inc in (await db.active_incidents(provider, grp, int(now.timestamp())))[:2]:
-        lines.append(incident_line(inc, now))  # аварія з часом ремонту на адресах групи (сайт ДТЕК / канали)
+    if not share and not alert:  # те саме відключення вже описане рядком «Офіційно» — не дублюємо
+        for inc in (await db.active_incidents(provider, grp, int(now.timestamp())))[:2]:
+            lines.append(incident_line(inc, now))  # аварія з часом ремонту на адресах групи (сайт ДТЕК / канали)
     if sensors := svitlobot.status_line(await svitlobot.group_state(provider, grp)):
         lines.append(sensors)  # фактичний стан за датчиками в будинках групи
-    if city_em:
+    if city_em and "кстрен" not in head + sub:  # у заголовку вже сказано про екстрені — не повторюємо
         lines.append("🚨 У Дніпрі діють екстрені відключення — графік зараз не діє")
     if not city_em and not is_emergency_alert(alert) and (sched_line := _schedule_line(today_slots, slot, t)):
         lines.append(sched_line)
     return "\n".join(lines).rstrip()
 
 
-FRESH_SEC = 15 * 60  # дані перевірки адрес на сайті ДТЕК вважаємо свіжими 15 хв
+# дані перевірки адрес на сайті ДТЕК свіжі весь інтервал опитування (30 хв) + 10 хв запасу на паузи між вулицями
+FRESH_SEC = (DTEK_POLL_INTERVAL_SEC or 15 * 60) + 10 * 60
+
+
+async def _site_probe() -> dict | None:
+    return json.loads(await db.kv_get("site_probe") or "null")
 
 
 async def _site_group(grp: str, now: datetime) -> dict | None:
@@ -292,7 +298,16 @@ async def house_block(user: dict) -> str | None:
     addr = f"{escape(user['street'])}, {escape(user['house'])}"
     now = datetime.now(TZ)
     if not seen or now.timestamp() - seen.get("ts", 0) > FRESH_SEC:
-        return f"🏠 <b>Твій будинок</b> ({addr}): сайт ДТЕК зараз не відповідає — дивись нижче за групою"
+        probe = await _site_probe()
+        if probe and not probe.get("ok"):  # остання перевірка справді впала
+            return f"🏠 <b>Твій будинок</b> ({addr}): сайт ДТЕК зараз не відповідає — дивись нижче за групою"
+        nxt = ""
+        if probe and DTEK_POLL_INTERVAL_SEC:
+            at = datetime.fromtimestamp(probe["ts"] + DTEK_POLL_INTERVAL_SEC, TZ)
+            nxt = f", наступна ≈ {at:%H:%M}" if at > now else ""
+        every = f"раз на {DTEK_POLL_INTERVAL_SEC // 60} хв" if DTEK_POLL_INTERVAL_SEC else "періодично"
+        return (f"🏠 <b>Твій будинок</b> ({addr}): ще не перевіряв на сайті ДТЕК — перевіряю {every}{nxt}. "
+                "Поки дивись нижче за групою")
     ago = int(now.timestamp() - seen["ts"]) // 60
     checked = f"<i>сайт ДТЕК, {ago} хв тому</i>" if ago else "<i>сайт ДТЕК, щойно</i>"
     if seen.get("kind") and seen["kind"] != "schedule":
@@ -301,13 +316,8 @@ async def house_block(user: dict) -> str | None:
         return f"🏠 <b>Твій будинок</b> ({addr})\n🔴 {seen.get('reason') or 'відключення'}{until} · {checked}"
     if seen.get("kind") == "schedule":
         return f"🏠 <b>Твій будинок</b> ({addr})\n🔴 відключення за графіком · {checked}"
-    text = f"🏠 <b>Твій будинок</b> ({addr})\n✅ відключень немає · {checked}"
-    if user.get("grp") and (share := await _group_share(user["grp"], now)):
-        # у тебе на сайті чисто, а інші адреси групи вже під екстреним — часто це доходить і до тебе
-        text += "\n⚠️ Але по групі вже є екстрене — можуть вимкнути й тебе:\n" + share
-    elif user.get("grp") and (inc := await db.active_incidents("dtek", user["grp"], int(now.timestamp()))):
-        text += "\n⚠️ " + incident_line(inc[0], now)
-    return text
+    # лише про сам будинок: що діється по групі (екстрене на інших адресах, аварії) — один раз, у «По групі»
+    return f"🏠 <b>Твій будинок</b> ({addr})\n✅ відключень немає · {checked}"
 
 
 def incident_until(inc: dict, now: datetime) -> str:

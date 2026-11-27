@@ -235,7 +235,15 @@ class HouseWatchTests(DbCase):
         self.assertIn("сайт ДТЕК", block)
         await db.kv_set("house_seen:1", json.dumps({"kind": None, "ts": int(time.time())}))
         self.assertIn("✅ відключень немає", await status.house_block(await db.get_user(1)))
+        # опитування раз на 30 хв: дані 25-хвилинної давності — ще свіжі, не «сайт не відповідає»
+        await db.kv_set("house_seen:1", json.dumps({"kind": None, "ts": int(time.time()) - 25 * 60}))
+        self.assertIn("✅ відключень немає", await status.house_block(await db.get_user(1)))
         await db.kv_set("house_seen:1", json.dumps({"kind": None, "ts": int(time.time()) - 3600}))
+        await db.kv_set("site_probe", json.dumps({"ok": True, "ts": int(time.time()) - 10 * 60}))
+        block = await status.house_block(await db.get_user(1))
+        self.assertIn("ще не перевіряв", block)  # сайт працює — просто ще не дійшла черга
+        self.assertNotIn("не відповідає", block)
+        await db.kv_set("site_probe", json.dumps({"ok": False, "ts": int(time.time())}))
         self.assertIn("не відповідає", await status.house_block(await db.get_user(1)))
         self.assertIsNone(await status.house_block(await db.get_user(2)))  # без адреси
 
@@ -249,12 +257,11 @@ class HouseWatchTests(DbCase):
         self.assertIn("🚨 Офіційно (сайт ДТЕК): екстрене у 3 з 20 перевірених адрес групи, до <b>18:05", text)
         self.assertIn("· вул. Х", text)
         self.assertNotIn("та ін.", text)
-        # у мого будинку чисто, а по групі є екстрене — показуємо в блоці «Твій будинок»
+        # у мого будинку чисто, а по групі є екстрене — блок будинку лише про будинок, група — один раз нижче
         await db.kv_set("house_seen:1", json.dumps({"kind": None, "ts": int(time.time())}))
         block = await status.house_block(await db.get_user(1))
         self.assertIn("✅ відключень немає", block)
-        self.assertIn("Але по групі вже є екстрене", block)
-        self.assertIn("3 з 20", block)
+        self.assertNotIn("3 з 20", block)
         # канал теж пише про відключення — рядок сайту не ховаємо
         await db.add_alert("ch1", "off", "1.2", "13:30", "🚨 <b>Аварійне відключення</b>", "dtek", "channel")
         with patch.object(status, "get_schedule", AsyncMock(return_value={"today": {"1.2": []}})):

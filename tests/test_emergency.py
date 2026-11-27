@@ -195,7 +195,8 @@ class SiteAlertTests(DbTestCase):
         self.assertIn("екстрене відключення", now)
         self.assertIn("до <b>17:16", now)
         self.assertIn("🚨 Офіційно (сайт ДТЕК): екстрене у 3 з 4 перевірених адрес групи", now)
-        self.assertIn("🚧 Аварія по групі 1.2: екстрене відключення · вул. Микитинська, до <b>17:16", now)
+        self.assertNotIn("🚧", now)  # те саме відключення вже в рядку «Офіційно» — без дубля
+        self.assertEqual(now.count("Микитинська"), 1)
         self.assertNotIn("локальна аварія", now)
 
         self.assertEqual(await self.check(street_payload()), [])  # той самий стан — без повторів
