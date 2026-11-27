@@ -135,6 +135,15 @@ async def official_outage(grp: str, provider: str, sch: dict | None = None, now:
     return alert, slot, (min(starts) if starts else None), until
 
 
+async def partial_outage(grp: str, provider: str, alert: dict | None, slot, now: datetime | None = None) -> bool:
+    """Офіційне відключення — лише на частині адрес групи (сайт ДТЕК: екстрене у 222 з 575), а не на всій:
+    тоді його «до 00:00» — не час для всієї групи. За графіком чи з каналу (про всю групу) — False."""
+    if provider != "dtek" or slot or (alert and alert.get("src") != "dteksite"):
+        return False
+    s = await _site_group(grp, now or datetime.now(TZ))
+    return bool(s and s.get("off") and s["off"] < s.get("total", 0))
+
+
 async def _recent_end(grp: str, provider: str, sch: dict, now: datetime) -> float | None:
     """Коли (за останні 3 год) офіційно скінчилось відключення групи: «до …» аварії минуло, сайт ДТЕК написав
     «екстрене закінчилось» або скінчився слот графіка. None — офіційних відключень останнім часом не було."""
@@ -219,7 +228,10 @@ async def verdict(grp: str, provider: str) -> str:
     official = bool(alert or slot)
     if f_on >= FAST_MIN and f_on >= 2 * f_off and not head.startswith("🟢"):
         head = "🟡 <b>Є світло, але не в усіх</b>"
-        sub = f"за 5 хв {f_on} людей пишуть «дали»" + (f" · офіційно — відключення{till}" if official else "")
+        sub = f"за 5 хв {f_on} людей пишуть «дали»"
+        if official:  # час із сайту ДТЕК — це кінець для частини адрес, а не для всієї групи
+            sub += (" · офіційно — відключення лише на частині адрес групи"
+                    if await partial_outage(grp, provider, alert, slot, now) else f" · офіційно — відключення{till}")
         note = None
     elif f_off >= FAST_MIN and f_off >= 2 * f_on and not head.startswith("🔴"):
         head = "🟠 <b>Світла немає, але не в усіх</b>"

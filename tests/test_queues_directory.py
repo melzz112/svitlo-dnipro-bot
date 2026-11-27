@@ -501,6 +501,8 @@ class DirectoryRefreshTests(DbCase):
     def respond(self, method, url, form):
         if method == "GET":
             return 200, page(list(self.site))
+        if form["method"] == "getStreets":
+            return 200, {"result": True, "streets": {"м. Дніпро": list(self.site)}}
         self.asked.append(form["data[1][value]"])
         return 200, {"result": True, "data": self.site[form["data[1][value]"]]}
 
@@ -508,6 +510,8 @@ class DirectoryRefreshTests(DbCase):
         self.asked, bot = [], AsyncMock()
         with fake_dtek(self.respond), patch.object(self.dr, "ADMIN_IDS", [77]):
             await self.dr.start("fast")
+            self.assertTrue(await self.dr.step(bot))  # спершу — перелік вулиць
+            await db.kv_set(self.dr.KEY, json.dumps({**await self.dr.state(), "last": 0}))
             self.assertTrue(await self.dr.step(bot))
             self.assertFalse(await self.dr.step(bot))  # темп: наступна вулиця — через 6 с
             dtek_http.backoff("тест")
@@ -551,3 +555,51 @@ class DirectoryRefreshTests(DbCase):
         cb.data = "adm:db:stop"
         await handlers.db_action(cb)
         self.assertFalse((await dr.state())["running"])
+
+
+class DirectoryNewAndGoneTests(DirectoryRefreshTests):
+    async def test_new_street_new_house_and_demolished_house(self):
+        self.site["вул. Нова"] = {"1": dtek_house("18.1"), "3": dtek_house(None)}  # нова вулиця на сайті
+        self.site["вул. Космічна"] = {"7": dtek_house("14.1"), "9": dtek_house("14.1")}  # новий будинок 9
+        self.site["вул. Робоча"] = {}  # порожня відповідь — збій, будинок 5 не чіпаємо
+        self.site["вул. Березинська"] = {"43": dtek_house("14.1")}  # будинок 45 знесли
+        self.asked, bot = [], AsyncMock()
+        with fake_dtek(self.respond), patch.object(self.dr, "ADMIN_IDS", [77]):
+            await self.dr.start("fast")
+            for _ in range(7):
+                await db.kv_set(self.dr.KEY, json.dumps({**await self.dr.state(), "last": 0}))
+                await self.dr.step(bot)
+        self.assertIn("вул. Нова", self.asked)
+        self.assertEqual((await db.find_house("вул. Нова", "1"))["group_name"], "18.1")
+        self.assertIsNotNone(await db.find_house("вул. Космічна", "9"))
+        self.assertIsNone(await db.find_house("вул. Березинська", "45"))
+        self.assertIsNotNone(await db.find_house("вул. Робоча", "5"))
+        st = await self.dr.state()
+        self.assertEqual((st["new_streets"], st["added"], st["removed"], st["total"]), (1, 3, 1, 4))
+        text = bot.send_message.await_args.args[1]
+        self.assertIn("Нових вулиць: 1 · нових будинків: 3 · прибрано будинків: 1", text)
+
+
+class PartialOutageWordingTests(DbCase):
+    async def _verdict_with(self, off: int, total: int) -> str:
+        end = (datetime.now(TZ) + timedelta(hours=3)).strftime("%H:%M %d.%m.%Y")
+        await db.kv_set("site_grp:14.1", json.dumps({"total": total, "off": off, "end": end, "ts": int(time.time()),
+                                                     "streets": ["вул. Тополина"], "n_streets": 1}))
+        await db.add_alert(f"site:off:14.1:{off}", "off", "14.1", dtek_site.short_dt(end),
+                           "🚨 <b>Екстрене відключення</b> · група <b>14.1</b>", "dtek", "dteksite", sent=1)
+        for who in "abcde":
+            await db.add_chat_msg(f"chat{off}", f"14.1 дали {who}{off}", None, "on", ["14.1"], who=f"{who}{off}")
+        return await _verdict("14.1")
+
+    async def test_time_not_for_whole_group_when_only_part_of_addresses(self):
+        G.register(NEW_QUEUES)
+        text = await self._verdict_with(222, 575)
+        self.assertIn("Є світло, але не в усіх", text)
+        self.assertIn("офіційно — відключення лише на частині адрес групи", text)
+        self.assertNotIn("офіційно — відключення до", text)
+        self.assertIn("екстрене у 222 з 575 перевірених адрес групи, до", text)  # час — при адресах
+
+    async def test_time_kept_when_whole_group_is_off(self):
+        G.register(NEW_QUEUES)
+        text = await self._verdict_with(575, 575)
+        self.assertIn("офіційно — відключення до", text)

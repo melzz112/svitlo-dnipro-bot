@@ -13,6 +13,7 @@ import db
 import dtek_http
 import dtek_site
 import groups as G
+from address import norm_house
 from config import ADMIN_IDS
 
 log = logging.getLogger(__name__)
@@ -73,6 +74,8 @@ async def step(bot) -> bool:
         return False
     if time.time() - st.get("last", 0) < PACES.get(st.get("pace"), PACES["slow"]):
         return False
+    if not st.get("streets_synced"):  # спершу — повний перелік вулиць: нові вулиці теж потраплять в обхід
+        return await _sync_streets(st)
     nxt = await _next_street(st.get("cursor", 0))
     if nxt is None:
         await _finish(bot, st)
@@ -81,8 +84,15 @@ async def step(bot) -> bool:
     st["last"], st["street"] = int(time.time()), street
     await _save(st)
     try:
+        before = await _house_norms(street)
         async with dtek_site._Session() as s:
-            await s.houses(street)  # пише будинки й last_polled_at
+            houses = await s.houses(street)  # пише будинки (нові — додає) й last_polled_at
+        now = {norm_house(h.num) for h in houses}
+        gone = before - now if now else set()  # порожня відповідь там, де були будинки, — збій, не знесення
+        if gone:
+            await _delete_houses(street, gone)
+        st["added"] = st.get("added", 0) + len(now - before)
+        st["removed"] = st.get("removed", 0) + len(gone)
         st["done"] += 1
         st["cursor"] = sid
     except dtek_http.DtekError as e:  # антибот / мережа: пауза вже стоїть, цю ж вулицю — після неї
@@ -97,9 +107,44 @@ async def step(bot) -> bool:
     else:
         st["retries"] = 0
     fresh = await state() or st  # поки йшов запит, адмін міг зупинити чи змінити темп
-    await _save({**fresh, **{k: st[k] for k in ("last", "street", "done", "failed", "cursor") if k in st},
-                 "retries": st.get("retries", 0)})
+    await _save({**fresh, **{k: st[k] for k in ("last", "street", "done", "failed", "cursor", "added", "removed")
+                             if k in st}, "retries": st.get("retries", 0)})
     return True
+
+
+async def _sync_streets(st: dict) -> bool:
+    """getStreets (один запит) -> нові вулиці в dtek_streets; вони отримують більший id і потрапляють в обхід."""
+    st["last"] = int(time.time())
+    try:
+        async with dtek_site._Session() as s:
+            names = await s.street_list()
+    except dtek_http.DtekError as e:  # пауза вже стоїть — спробуємо після неї
+        log.warning("довідник: перелік вулиць — %r", e)
+        await _save({**(await state() or st), "last": st["last"]})
+        return True
+    except ValueError as e:
+        log.warning("довідник: перелік вулиць — %r", e)
+        names = []
+    new = await db.upsert_streets(names) if names else 0
+    if new:
+        log.info("довідник: нових вулиць %d", new)
+    total = (await db.directory_stats())["streets"]
+    await _save({**(await state() or st), "last": st["last"], "streets_synced": True, "new_streets": new,
+                 "total": total})
+    return True
+
+
+async def _house_norms(street: str) -> set[str]:
+    rows = await db._all("SELECT h.house_norm n FROM dtek_houses h JOIN dtek_streets s ON s.id=h.street_id "
+                         "WHERE s.raw_name=?", (street,))
+    return {r["n"] for r in rows}
+
+
+async def _delete_houses(street: str, norms: set[str]):
+    """Будинків уже немає на сайті ДТЕК — прибираємо з довідника."""
+    marks = ",".join("?" * len(norms))
+    await db._exec(f"DELETE FROM dtek_houses WHERE street_id=(SELECT id FROM dtek_streets WHERE raw_name=?) "
+                   f"AND house_norm IN ({marks})", (street, *norms))
 
 
 async def _finish(bot, st: dict):
@@ -127,7 +172,9 @@ def changes(before: dict, after: dict) -> list[str]:
 
 def summary(st: dict) -> str:
     took = (st.get("finished") or time.time()) - st["started"]
-    lines = [f"Вулиць: {st['done']} · помилок: {st['failed']} · за {int(took // 3600)} год {int(took % 3600 // 60)} хв"]
+    lines = [f"Вулиць: {st['done']} · помилок: {st['failed']} · за {int(took // 3600)} год {int(took % 3600 // 60)} хв",
+             f"Нових вулиць: {st.get('new_streets', 0)} · нових будинків: {st.get('added', 0)} · "
+             f"прибрано будинків: {st.get('removed', 0)}"]
     diff = changes(st.get("before") or {}, st.get("after") or {})
     lines.append("Зміни черг (будинків):\n" + "\n".join(diff) if diff else "Черги будинків не змінились.")
     return "\n".join(lines)
