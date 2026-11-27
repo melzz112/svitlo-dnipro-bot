@@ -1,7 +1,7 @@
 """Запити до сайту ДТЕК (сторінка «Відключення» і «Перевірити адресу»).
 
 Клієнт — curl_cffi.requests.AsyncSession(impersonate="chrome"): відбиток TLS/HTTP2 справжнього Chrome, тож
-Incapsula не відрізняє бота від браузера за «рукостисканням». Одна сесія на процес: кукі (Incapsula, csrf)
+Incapsula не відрізняє бота від браузера за «рукостисканням». Напряму, без проксі. Одна сесія на процес: кукі (Incapsula, csrf)
 живуть між запитами, заголовки — як у браузера, AJAX-запити — з X-Requested-With / Origin / Referer.
 
 Бережний режим (сервер): будь-яка помилка чи антибот -> пауза DTEK_BACKOFF_SEC (30 хв), за цей час жоден
@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from curl_cffi import CurlError
 from curl_cffi.requests import AsyncSession
 
-from config import DTEK_BACKOFF_SEC, DTEK_PROXY
+from config import DTEK_BACKOFF_SEC
 
 log = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ class Response:
 
 def new_session() -> AsyncSession:
     """Окрема функція — щоб тести підставляли фейкову сесію."""
-    return AsyncSession(impersonate=IMPERSONATE, proxy=DTEK_PROXY, headers=dict(HEADERS), timeout=TIMEOUT)
+    return AsyncSession(impersonate=IMPERSONATE, headers=dict(HEADERS), timeout=TIMEOUT)
 
 
 _session = None

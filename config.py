@@ -36,8 +36,6 @@ if os.getenv("DTEK_PROBE_SEC", "").strip() == "0":  # стара змінна: �
 DTEK_POLL_PAUSE_MIN = float(os.getenv("DTEK_POLL_PAUSE_MIN") or 3)
 DTEK_POLL_PAUSE_MAX = float(os.getenv("DTEK_POLL_PAUSE_MAX") or 5)
 DTEK_BACKOFF_SEC = int(os.getenv("DTEK_BACKOFF_SEC") or 1800)
-# Проксі не потрібен (curl_cffi з відбитком Chrome); лишено як опцію: http://user:pass@host:port або socks5://…
-DTEK_PROXY = os.getenv("DTEK_PROXY", "").strip() or None
 
 # Райони/масиви Дніпра для розпізнавання в чатах (укр + рос + сленг з чатів).
 # Ключі — regex, що шукаються з початку слова. Спершу масиви (точніше), потім райони.
