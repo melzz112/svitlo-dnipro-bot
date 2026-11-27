@@ -145,6 +145,26 @@ def change_text(c, name: str, emergency: bool = False) -> str:
     return text
 
 
+# ---------- «вимкнули» — один раз: замок на групу ----------
+# Перше «вимкнули» (чати, датчики, канал, сайт ДТЕК) замикає групу: наступні «вимкнули» з чатів і датчиків
+# не шлемо — люди вже знають. Знімає замок лише надійне «світло дали»: датчики Світлобота, канал чи сайт ДТЕК.
+# «Дали» з чатів замок не знімає (часто це «дали частині»). Страховка — замок сам спадає за OFF_LOCK_SEC.
+OFF_LOCK_SEC = 4 * 3600
+
+
+async def off_locked(prov: str, grp: str) -> bool:
+    v = json.loads(await db.kv_get(f"offlock:{prov}:{grp}") or "null")
+    return bool(v) and time.time() - v.get("ts", 0) < OFF_LOCK_SEC
+
+
+async def lock_off(prov: str, grp: str, src: str):
+    await db.kv_set(f"offlock:{prov}:{grp}", json.dumps({"ts": int(time.time()), "src": src}))
+
+
+async def unlock_off(prov: str, grp: str):
+    await db.kv_set(f"offlock:{prov}:{grp}", "")
+
+
 ON_HOLD_SEC = 5 * 60  # «світло дали» з каналів чекає 5 хв, щоб звірити з чатами
 
 
@@ -182,6 +202,8 @@ async def send_alerts(bot: Bot):
         if a["kind"] in ("on", "off") and prov in db.PROVIDERS:
             # група вже знає — «люди пишуть» з тим самим не дублюємо
             await db.kv_set(f"{_pkey(prov, 'crowd')}:{a['grp']}", a["kind"])
+            if a["grp"] != "*":
+                await (lock_off(prov, a["grp"], src) if a["kind"] == "off" else unlock_off(prov, a["grp"]))
         for u in users:
             if _matches(prov, u) and (a["grp"] == "*" or a["grp"] == u["grp"]):
                 await _send(bot, u["id"], a["text"] + f"\n\n<i>{ALERT_FOOTER.get(src, ALERT_FOOTER['channel'])}</i>")
@@ -232,6 +254,11 @@ async def crowd_check(bot: Bot):
             if time.time() - last_push < 20 * 60:  # не смикаємо людей частіше раз на 20 хв
                 continue
             await db.kv_set(f"{skey}:{grp}", new)
+            if new == "off":
+                if await off_locked(prov, grp):  # про це відключення група вже знає — не повторюємо
+                    log.info("crowd %s %s -> off: тихо, група вже знає (%d off)", prov, grp, n_off)
+                    continue
+                await lock_off(prov, grp, "crowd")
             await db.kv_set(f"{skey}_ts:{grp}", str(int(time.time())))
 
             if new == "on":
@@ -499,6 +526,12 @@ async def svitlobot_check(bot: Bot):
     users = [u for u in await db.users_with_group() if u["notify_on"]]
     for c in changes:
         log.info("світлобот: %s %s -> %s (%d/%d)", c.provider, c.grp, c.state, c.stat.on, c.stat.alive)
+        if c.state == svitlobot.OFF:
+            if await off_locked(c.provider, c.grp):
+                continue  # «вимкнули» вже було — датчики лише підтверджують
+            await lock_off(c.provider, c.grp, "svitlobot")
+        else:
+            await unlock_off(c.provider, c.grp)  # датчики бачать світло — наступне «вимкнули» вже новина
         text = svitlobot.notify_text(c, db.PROVIDER_NAME[c.provider]) + "\n\n<i>За даними датчиків Світлобота</i>"
         for u in users:
             if u["grp"] == c.grp and _prov(u) == c.provider:

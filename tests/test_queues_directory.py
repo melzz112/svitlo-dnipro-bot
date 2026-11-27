@@ -603,3 +603,62 @@ class PartialOutageWordingTests(DbCase):
         G.register(NEW_QUEUES)
         text = await self._verdict_with(575, 575)
         self.assertIn("офіційно — відключення до", text)
+
+
+class OffLockTests(DbCase):
+    """Перше «вимкнули» — пуш; далі «вимкнули» з чатів/датчиків для тієї ж групи — тиша, доки надійно не дали."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        G.register(NEW_QUEUES)
+        await db.set_user(1, grp="14.1", provider="dtek")
+        self.n = 0
+
+    async def wave(self, event: str, people: int = 4):
+        self.n += 1
+        for i in range(people):
+            await db.add_chat_msg("chat", f"14.1 {event} {self.n}-{i}", None, event, ["14.1"], who=f"w{self.n}-{i}")
+
+    async def crowd(self) -> list[str]:
+        await db.kv_set("crowd_ts:14.1", "0")  # без 20-хвилинного інтервалу між пушами
+        bot = AsyncMock()
+        with patch.object(notifier, "get_schedule", AsyncMock(return_value={"today": {"14.1": []}})), \
+                patch.object(status, "get_schedule", AsyncMock(return_value={"today": {"14.1": []}})):
+            await notifier.crowd_check(bot)
+        return [c.args[1] for c in bot.send_message.await_args_list]
+
+    async def clear_chat(self):
+        await db._exec("DELETE FROM chat_msgs")
+
+    async def test_second_off_from_chats_is_silent_until_reliable_on(self):
+        await self.wave("off")
+        sent = await self.crowd()
+        self.assertEqual(len(sent), 1)
+        self.assertIn("вимкнули світло", sent[0])
+        await self.clear_chat()
+        await self.wave("on", 8)
+        self.assertIn("дали світло", (await self.crowd())[0])  # «дали» з чатів — пуш є, але замок лишається
+        await self.clear_chat()
+        await self.wave("off")
+        self.assertEqual(await self.crowd(), [])  # знову «нема» в чатах — група вже знає
+        await notifier.unlock_off("dtek", "14.1")  # датчики / канал / сайт ДТЕК: світло дали
+        await self.clear_chat()
+        await self.wave("on", 8)
+        await self.crowd()
+        await self.clear_chat()
+        await self.wave("off")
+        self.assertEqual(len(await self.crowd()), 1)  # нове відключення — знову пуш
+
+    async def test_lock_expires(self):
+        await notifier.lock_off("dtek", "14.1", "crowd")
+        self.assertTrue(await notifier.off_locked("dtek", "14.1"))
+        with patch.object(notifier.time, "time", return_value=time.time() + notifier.OFF_LOCK_SEC + 1):
+            self.assertFalse(await notifier.off_locked("dtek", "14.1"))
+
+    async def test_official_alerts_lock_and_unlock(self):
+        await db.add_alert("ch-off", "off", "14.1", "18:00", "🚨 <b>Аварійне відключення</b> · група <b>14.1</b>")
+        await notifier.send_alerts(AsyncMock())
+        self.assertTrue(await notifier.off_locked("dtek", "14.1"))
+        await db.add_alert("site-on", "on", "14.1", None, "✅ Група 14.1: екстрене закінчилось", "dtek", "dteksite")
+        await notifier.send_alerts(AsyncMock())
+        self.assertFalse(await notifier.off_locked("dtek", "14.1"))
