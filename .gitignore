@@ -9,3 +9,5 @@ data/
 autoupdate.log
 .autoupdate.lock
 dtek_cookies.json
+.base_req
+REVISION
