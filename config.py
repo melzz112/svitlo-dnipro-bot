@@ -37,6 +37,34 @@ DTEK_POLL_PAUSE_MIN = float(os.getenv("DTEK_POLL_PAUSE_MIN") or 3)
 DTEK_POLL_PAUSE_MAX = float(os.getenv("DTEK_POLL_PAUSE_MAX") or 5)
 DTEK_BACKOFF_SEC = int(os.getenv("DTEK_BACKOFF_SEC") or 1800)
 
+# Браузерна сесія для сайту ДТЕК: AJAX (getStreets / getHomeNum) хоче кукі після JS-перевірки Incapsula.
+# Chromium (nodriver, headless) запускається на кілька секунд лише по кукі й User-Agent і одразу закривається.
+DTEK_BROWSER_SESSION_ENABLED = os.getenv("DTEK_BROWSER_SESSION_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+DTEK_COOKIE_TTL_SEC = int(os.getenv("DTEK_COOKIE_TTL_SEC") or 1200)  # кукі старші за 20 хв — оновлюємо
+DTEK_BROWSER_COOLDOWN_SEC = int(os.getenv("DTEK_BROWSER_COOLDOWN_SEC") or 300)  # браузер — не частіше раза на 5 хв
+DTEK_BROWSER_TIMEOUT_SEC = int(os.getenv("DTEK_BROWSER_TIMEOUT_SEC") or 60)  # жорсткий ліміт на весь запуск
+
+
+def _find_chrome() -> str | None:
+    """Docker: /usr/bin/chromium; локально — Chromium/Chrome з PATH або стандартних місць Windows/Linux/macOS."""
+    import shutil
+
+    for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "chrome"):
+        if path := shutil.which(name):
+            return path
+    candidates = [
+        "/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome", "/snap/bin/chromium",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ] + [os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")
+         for base in filter(None, (os.getenv("PROGRAMFILES"), os.getenv("PROGRAMFILES(X86)"), os.getenv("LOCALAPPDATA")))]
+    return next((p for p in candidates if os.path.isfile(p)), None)
+
+
+CHROME_EXECUTABLE_PATH = os.getenv("CHROME_EXECUTABLE_PATH", "").strip() or _find_chrome()
+# кукі й User-Agent з браузера переживають перезапуск бота (поруч із БД)
+DTEK_COOKIE_CACHE = os.getenv("DTEK_COOKIE_CACHE", "").strip() or os.path.join(
+    os.path.dirname(os.path.abspath(DB_PATH)), "dtek_cookies.json")
+
 # Райони/масиви Дніпра для розпізнавання в чатах (укр + рос + сленг з чатів).
 # Ключі — regex, що шукаються з початку слова. Спершу масиви (точніше), потім райони.
 DISTRICTS = {

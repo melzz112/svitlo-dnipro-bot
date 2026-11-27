@@ -15,10 +15,19 @@ class _Resp:
         self.headers = {}
 
 
+class _Jar(dict):
+    """Як банка кукі curl_cffi: set(name, value, domain=...)."""
+
+    def set(self, name, value, domain=None, **kw):
+        self[name] = value
+
+
 class FakeSession:
     def __init__(self, respond):
         self.respond = respond
         self.calls: list[tuple[str, str, dict, dict]] = []
+        self.cookies = _Jar()
+        self.headers: dict[str, str] = {}
 
     async def request(self, method, url, data=None, headers=None, **kw):
         form = dict(data or {})

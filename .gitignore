@@ -8,3 +8,4 @@ __pycache__/
 data/
 autoupdate.log
 .autoupdate.lock
+dtek_cookies.json
