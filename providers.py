@@ -293,6 +293,15 @@ def _stale(key, today: date) -> dict[str, DaySchedule] | None:
     return None
 
 
+async def _health(ok: bool, err: str = ""):
+    try:
+        import health
+
+        await health.mark("yasno", ok, err)
+    except Exception:  # стан джерела — не привід лишити людей без графіка
+        log.exception("health yasno")
+
+
 async def channel_schedule(provider: str, day: date) -> DaySchedule:
     import db
 
@@ -317,10 +326,14 @@ async def _site_schedule(source: str, provider: str, today: date) -> dict[str, D
                     snapshot = await fetch_outage_data_ua(today, provider)
         except (httpx.HTTPError, dtek_http.DtekError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as exc:
             log.warning("%s schedule for %s unavailable: %r", source, provider, exc)
+            if source == "yasno":
+                await _health(False, f"{provider}: {exc!r}")
             _site_cache[key] = (today, time.monotonic() + SITE_RETRY_SEC[source], None)
             return _stale(key, today)
         _site_cache[key] = (today, time.monotonic() + SITE_CACHE_BY_SOURCE.get(source, SITE_CACHE_SEC), snapshot)
         _site_last_good[key] = (today, time.monotonic(), snapshot)
+        if source == "yasno":
+            await _health(True)
         if source == "yasno":
             try:
                 await track_yasno(provider, today, snapshot)
