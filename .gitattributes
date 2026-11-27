@@ -1,0 +1,3 @@
+# shell-скрипти й Dockerfile виконуються на Linux-сервері: лише LF (git archive на Windows інакше дає CRLF)
+*.sh text eol=lf
+Dockerfile* text eol=lf

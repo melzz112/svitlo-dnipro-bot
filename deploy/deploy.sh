@@ -16,5 +16,5 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
 fi
 REV=$(git rev-parse --short HEAD)
 echo "викатую: $(git log -1 --format='%h %s')"
-git archive --format=tar HEAD | $SSH "tar -x -C $DIR && echo $REV > $DIR/REVISION"
+git -c core.autocrlf=false archive --format=tar HEAD | $SSH "tar -x -C $DIR && echo $REV > $DIR/REVISION"
 $SSH "sh $DIR/deploy/server_update.sh"
