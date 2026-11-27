@@ -113,7 +113,7 @@ class AddressTests(DbCase):
         await db.set_user(7, addr_q="Яворницького|3")  # цієї вулиці сайт цього разу не дав — чекає далі
         probe = Probe(houses=[House("вул. Березинська", "45", ["2.1"], None), House("вул. Березинська", "43", ["2.1"], None)])
         bot = AsyncMock()
-        with patch.object(notifier, "DTEK_PROBE_SEC", 180), patch.object(notifier, "SOURCE", "dtek"), \
+        with patch.object(notifier, "DTEK_POLL_INTERVAL_SEC", 180), patch.object(notifier, "SOURCE", "dtek"), \
                 patch.object(notifier, "CITY", "dnipro"), patch.object(notifier, "_site_next", 0), \
                 patch.object(dtek_site, "probe", AsyncMock(return_value=probe)) as pr, \
                 patch.object(dtek_site, "apply", AsyncMock(return_value=[])), \

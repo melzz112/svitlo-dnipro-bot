@@ -14,10 +14,12 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import address
 import db
+import dtek_http
 import dtek_site
 import handlers
 import notifier
 import status
+from fake_dtek import fake_dtek
 from test_emergency import EMERGENCY, house
 
 STREETS = ["вул. Соколина", "просп. Дмитра Яворницького", "просп. Петра Калнишевського", "вул. Шевченка",
@@ -130,16 +132,13 @@ def yavornytskoho(num3=None):
 def mock_site(street_houses: dict, page_html=None):
     posts = []
 
-    def respond(request):
-        if request.method == "GET":
-            return httpx.Response(200, text=page_html or page())
-        form = dict(httpx.QueryParams(request.content.decode()))
+    def respond(method, url, form):
+        if method == "GET":
+            return 200, page_html or page()
         posts.append(form["data[1][value]"])
-        return httpx.Response(200, json=street_houses.get(form["data[1][value]"], {"data": {}}))
+        return 200, street_houses.get(form["data[1][value]"], {"data": {}})
 
-    client = httpx.AsyncClient
-    return posts, patch.object(dtek_site.httpx, "AsyncClient", side_effect=lambda **kw: client(
-        **{**kw, "transport": httpx.MockTransport(respond)}))
+    return posts, fake_dtek(respond)
 
 
 class DbCase(unittest.IsolatedAsyncioTestCase):
@@ -162,7 +161,7 @@ class LookupTests(DbCase):
         self.assertEqual(res.street, "просп. Дмитра Яворницького")
         self.assertEqual((res.house.num, res.house.groups), ("14А", ["3.1"]))
         self.assertEqual(posts, ["просп. Дмитра Яворницького"])  # один запит — на правильну вулицю
-        self.assertIn("вул. Соколина", json.loads(await db.kv_get("dtek_streets")))
+        self.assertIn("вул. Соколина", await db.street_names())  # перелік зі сторінки -> довідник dtek_streets
 
     async def test_house_not_in_dtek(self):
         _, p = mock_site({"просп. Дмитра Яворницького": yavornytskoho()})

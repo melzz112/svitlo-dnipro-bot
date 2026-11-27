@@ -1,7 +1,7 @@
 import asyncio
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -81,10 +81,11 @@ class ScheduleSourceTests(unittest.IsolatedAsyncioTestCase):
             "/Baskerville42/outage-data-ua/main/data/dnipro.json",
         ])
 
-    async def test_dtek_block_page_uses_yasno_without_reading_telegram(self):
+    async def test_yasno_first_dtek_site_not_touched(self):
+        hosts = []
+
         def respond(request):
-            if request.url.host == "www.dtek-dnem.com.ua":
-                return httpx.Response(200, text='<iframe src="/_Incapsula_Resource"></iframe>')
+            hosts.append(request.url.host)
             return httpx.Response(200, json={"1.1": {
                 "today": day_data(TODAY, "NoOutages"),
                 "tomorrow": day_data(TOMORROW, "NoOutages"),
@@ -96,13 +97,15 @@ class ScheduleSourceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(providers.httpx, "AsyncClient", side_effect=lambda **kwargs: async_client(
                 **{**kwargs, "transport": httpx.MockTransport(respond)},
             )),
+            patch.object(providers, "fetch_dtek", AsyncMock()) as dtek_page,
             patch.object(providers, "channel_schedule", AsyncMock()) as channel,
-            self.assertLogs("providers", "WARNING"),
         ):
             result = await get_schedule_days("dtek", today=TODAY)
         self.assertEqual(result["today"].source, "yasno")
         self.assertEqual(result["today"].groups, {"1.1": []})
         channel.assert_not_called()
+        dtek_page.assert_not_called()  # графік є в YASNO — сторінку ДТЕК (під антиботом) не смикаємо
+        self.assertEqual(hosts, ["app.yasno.ua"])
 
     async def test_falls_back_per_day_and_labels_the_actual_source(self):
         direct = DaySchedule({"1.1": [Slot(8, 10)]}, "dtek")
@@ -112,6 +115,7 @@ class ScheduleSourceTests(unittest.IsolatedAsyncioTestCase):
             patch.multiple(providers, SOURCE="dtek", _site_cache={}, _site_locks={}),
             patch.object(providers, "fetch_dtek", AsyncMock(return_value={"today": direct})),
             patch.object(providers, "fetch_yasno", AsyncMock(return_value={"tomorrow": tomorrow})) as yasno,
+            patch.object(providers, "fetch_outage_data_ua", AsyncMock(return_value={})),
             patch.object(providers, "channel_schedule", channel),
         ):
             result = await get_schedule_days("dtek", today=TODAY)
@@ -128,10 +132,12 @@ class ScheduleSourceTests(unittest.IsolatedAsyncioTestCase):
     async def test_pushes_schedule_to_matching_operator_without_duplicates(self):
         async def fetch(provider, *, today):
             start = 10 if provider == "dtek" else 12
-            return {
+            days = {
                 "today": DaySchedule({"1.1": [Slot(start, start + 2)]}, "yasno"),
                 "tomorrow": DaySchedule(),
             }
+            await providers.track_yasno(provider, today, days)  # як _site_schedule після свіжої відповіді YASNO
+            return days
 
         with (
             tempfile.TemporaryDirectory() as temp,
@@ -143,6 +149,9 @@ class ScheduleSourceTests(unittest.IsolatedAsyncioTestCase):
             await db.set_user(1, grp="1.1", provider="dtek")
             await db.set_user(2, grp="1.1", provider="cek")
             await db.kv_set("sched_init", "1")
+            yesterday = (datetime.now(providers.TZ).date() - timedelta(days=1)).isoformat()
+            for prov in ("dtek", "cek"):  # бот уже працював: знімки YASNO є, сьогоднішнього графіка ще не було
+                await db.save_snapshots(prov, yesterday, [("1.1", "old", "[]")])
             bot = AsyncMock()
             await notifier.tick(bot)
             await notifier.tick(bot)

@@ -18,8 +18,11 @@ from pathlib import Path
 
 import aiohttp
 
+import groups as G
+
+import groups as G
+
 from config import (
-    GROUPS,
     SVITLOBOT_CHANNELS_URL,
     SVITLOBOT_CITY_FILTER,
     SVITLOBOT_MIN_SENSORS,
@@ -110,9 +113,10 @@ def extract_group(*texts: str) -> tuple[str, str] | None:
         if not text:
             continue
         m = _GROUP_LABELED.search(text)
-        grp = m.group(1) if m and m.group(1) in GROUPS else None
+        grp = G.norm(m.group(1)) if m else None  # «група 14.1» — будь-яка відома черга (з даних ДТЕК/YASNO)
+        grp = grp if G.is_known(grp) else None
         if grp is None:
-            grp = next((g for g in _GROUP_BARE.findall(text) if g in GROUPS), None)
+            grp = next((g for g in _GROUP_BARE.findall(text) if G.is_known(g)), None)
         if grp is None:
             continue
         provider = "cek" if _CEK.search(text) and not _DTEK.search(text) else "dtek"
@@ -191,7 +195,7 @@ def groups_map() -> dict[str, tuple[str, str]]:
         except (OSError, ValueError):
             raw = {}
         _map_cache = (mtime, {k: (v["provider"], v["grp"]) for k, v in raw.items()
-                              if isinstance(v, dict) and v.get("grp") in GROUPS and v.get("provider") in ("dtek", "cek")})
+                              if isinstance(v, dict) and G.is_known(v.get("grp")) and v.get("provider") in ("dtek", "cek")})
     return _map_cache[1]
 
 

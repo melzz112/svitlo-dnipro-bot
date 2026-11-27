@@ -7,7 +7,8 @@ from datetime import datetime, timedelta
 from html import escape
 
 import db
-from config import DB_PATH, GROUPS, TZ
+import groups as G
+from config import DB_PATH, TZ
 
 DAY, WEEK = 86400, 7 * 86400
 
@@ -52,7 +53,7 @@ async def build() -> str:
     if by_grp:
         top = sorted(by_grp.items(), key=lambda x: (-x[1], x[0]))
         lines.append("По групах: " + ", ".join(f"{g} — {n}" for g, n in top))
-        empty = [g for g in GROUPS if g not in by_grp]
+        empty = [g for g in G.known() if g not in by_grp]
         if empty:
             lines.append(f"Без людей: {', '.join(empty)}")
 

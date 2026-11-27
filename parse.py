@@ -7,17 +7,20 @@
 import re
 from dataclasses import dataclass
 
-from config import DISTRICTS, GROUPS
+import groups as G
+from config import DISTRICTS
 
 # ---------- спільне ----------
 
 # У каналах: лише «1.1». Не чіпає дати/час (19.11.2026, 16.30) і списки будинків «(1, 2, 5)».
-GROUP_RE = re.compile(r"(?<![\d.:,/])([1-6])\.([12])(?!\d|:\d)")  # «1.1:» ок, «1.10»/«1.1:30» ні
+# Черги — будь-які X.Y («1.1» … «18.1»); «20.11.2026», «16:30» не чіпаємо, а «16.30»/«20.11» без контексту
+# відсіює реєстр відомих черг (groups.known: типові + усе, що бот бачив у даних ДТЕК/YASNO).
+GROUP_RE = re.compile(r"(?<![\d.:,/])(\d{1,2})\.(\d{1,2})(?!\d|:\d|\.\d)")  # «1.1:» ок, «1.1:30»/«20.11.2026» ні
 # У людей: ще «1,1» (без пробілу) і «1. 1»; «1, 2» — це номери будинків
-USER_GROUP_RE = re.compile(r"(?<![\d.:,/])([1-6])(?:\s?\.\s?|,)([12])(?!\d|:\d|,\s?\d)")
+USER_GROUP_RE = re.compile(r"(?<![\d.:,/])(\d{1,2})(?:\s?\.\s?|,)(\d{1,2})(?!\d|:\d|,\s?\d|\.\d)")
 # «черга 4», «4 група», «очередь 4» -> вся черга (4.1 + 4.2)
 QUEUE_RE = re.compile(
-    r"(?:черг[аиіу]|очеред[ьи]|груп[аиу])\s*№?\s*([1-6])(?![\d.,])|(?<![\d.,])([1-6])\s*(?:черг|очеред|груп)"
+    r"(?:черг[аиіу]|очеред[ьи]|груп[аиу])\s*№?\s*(\d{1,2})(?![\d.,])|(?<![\d.,])(\d{1,2})\s*(?:черг|очеред|груп)"
 )
 TIME_RE = r"(\d{1,2}:\d{2})(?:\s+(\d{2}\.\d{2})(?:\.\d{4})?)?"
 
@@ -66,12 +69,12 @@ def strip_footer(text: str) -> str:
 
 def find_groups(t: str, user=False) -> list[str]:
     """user=True — режим повідомлень людей: ще «1,1» і «черга 4»."""
-    found = {f"{a}.{b}" for a, b in (USER_GROUP_RE if user else GROUP_RE).findall(t)}
+    found = {G.norm(f"{a}.{b}") for a, b in (USER_GROUP_RE if user else GROUP_RE).findall(t)}
     if user:
         for a, b in QUEUE_RE.findall(t):
-            q = a or b
-            found |= {f"{q}.1", f"{q}.2"}
-    return sorted(g for g in found if g in GROUPS)
+            q = str(int(a or b))
+            found |= {g for g in G.known() if G.queue_of(g) == q}  # «черга 14» -> 14.1, 14.2 (які відомі)
+    return G.sort(g for g in found if g and G.is_known(g))
 
 
 def find_district(t: str) -> str | None:
@@ -161,7 +164,8 @@ def parse_schedule_posts(raw: str, today) -> list[tuple]:
         # початок частини — з початку її рядка (там буває «Графік … на 20.11.2026»)
         seg = t[t.rfind("\n", 0, start) + 1:end]
         tokens = sorted(
-            [(m.start(), "g", f"{m.group(1)}.{m.group(2)}") for m in GROUP_RE.finditer(seg)]
+            [(m.start(), "g", g) for m in GROUP_RE.finditer(seg)
+             if (g := G.norm(f"{m.group(1)}.{m.group(2)}")) and _schedule_group(seg, m.start(), g)]
             + [(m.start(), "i", m.groups()) for m in INTERVAL_RE.finditer(seg)]
         )
         groups: dict[str, list] = {}
@@ -181,6 +185,11 @@ def parse_schedule_posts(raw: str, today) -> list[tuple]:
             continue
         out.append((prov, _post_date(seg, today), groups))
     return out
+
+
+def _schedule_group(seg: str, pos: int, g: str) -> bool:
+    """У пості з графіком: відома черга — так; нова («Група 18.1») — лише з підписом «група/черга» перед нею."""
+    return G.is_known(g) or bool(re.search(r"(груп|черг|очеред|gpv)\w*\s*№?\s*$", seg[max(0, pos - 15):pos]))
 
 
 def parse_cek_schedule(raw: str, today) -> tuple | None:
@@ -505,7 +514,7 @@ def _groups_for(t: str, groups: list[str], event: str) -> list[str]:
 
 def _user_groups(t: str) -> list[str]:
     found = set(find_groups(t, user=True)) | {f"{a}.{b}" for a, b in DASH_GROUP_RE.findall(t)}
-    return sorted(g for g in found if g in GROUPS)
+    return G.sort(g for g in found if G.is_known(g))
 
 
 def _parse_one(raw: str) -> dict | None:

@@ -25,12 +25,13 @@ from html import unescape
 
 import httpx
 
-from config import GROUPS, TZ
+import groups as G
+from config import TZ
 from parse import INTERVAL_RE, _post_date
 
 CEK_URL = "https://cek.dp.ua/index.php/cpojivaham/vidkliuchennia.html"
 
-GROUP_LINE_RE = re.compile(r"Черг[аи]\s*№?\s*([1-6])\.([12])(?!\d)", re.I)
+GROUP_LINE_RE = re.compile(r"Черг[аи]\s*№?\s*(\d{1,2})\.(\d{1,2})(?!\d)", re.I)  # будь-яка черга X.Y
 SCHEDULE_HEAD_RE = re.compile(r"(гпв|графік)", re.I)
 SCHEDULE_HEAD_KEY_RE = re.compile(r"діятимуть|застосовуватим|відключення наступних черг|наступні черги", re.I)
 EXTRA_RE = re.compile(r"додатково", re.I)
@@ -92,7 +93,8 @@ def _parse_extra(text: str) -> tuple[float, float | None, list[str]] | None:
     m_end = re.search(r"до\s+(\d{1,2}):(\d{2})", text)
     end = _hours(*m_end.groups()) if m_end else None
     after = text.lower().split("черг", 1)[1] if "черг" in text.lower() else ""
-    groups = sorted({f"{a}.{b}" for a, b in re.findall(r"(?<![\d.])([1-6])\.([12])(?!\d)", after)} & set(GROUPS))
+    groups = G.sort(g for a, b in re.findall(r"(?<![\d.:])(\d{1,2})\.(\d{1,2})(?![\d:.]\d)", after)
+                    if (g := G.norm(f"{a}.{b}")))
     return (start, end, groups) if groups else None
 
 
@@ -131,7 +133,7 @@ def parse_page(html: str, today: date | None = None) -> CekState:
             groups: dict[str, list] = {}
             j = i + 1
             while j < len(ps) and (m := GROUP_LINE_RE.search(ps[j])):
-                g = f"{m.group(1)}.{m.group(2)}"
+                g = G.norm(f"{m.group(1)}.{m.group(2)}")
                 groups[g] = [(_hours(h1, m1), _hours(h2, m2), "off") for h1, m1, h2, m2 in INTERVAL_RE.findall(ps[j])]
                 j += 1
             if groups:
@@ -145,7 +147,7 @@ def parse_page(html: str, today: date | None = None) -> CekState:
     for idx, kind, data in events:
         if kind == "schedule" and data[0] not in state.days:
             d, groups, head = data
-            state.days[d] = CekDay(d, {g: list(v) for g, v in groups.items() if g in GROUPS}, head)
+            state.days[d] = CekDay(d, {g: list(v) for g, v in groups.items() if G.is_group(g)}, head)
             sched_idx[d] = idx
     # 2) «додатково» вище графіка своєї дати (або коли графіка на дату ще немає)
     for idx, kind, data in events:
@@ -201,8 +203,7 @@ if __name__ == "__main__":
     print("Екстрені в м. Дніпро:", "ТАК — " + (st.emergency_text or "") if st.emergency else "ні")
     for d, day in sorted(st.days.items()):
         print(f"\n{d}{' (лише «додатково»)' if day.partial else ''}: {day.header[:90]}")
-        for g in GROUPS:
-            if g in day.groups:
-                print(f"  {g}: {_fmt(day.groups[g])}")
+        for g in G.sort(day.groups):
+            print(f"  {g}: {_fmt(day.groups[g])}")
         for ex in day.extras:
             print(f"  + додатково {ex.grp} з {_fmt([(ex.start, ex.start, 'off')]).split('-')[0]}")

@@ -12,7 +12,9 @@ from datetime import datetime, timedelta
 from config import TZ
 
 import db
+import dtek_http
 import dtek_site
+from fake_dtek import fake_dtek
 import handlers
 import keyboards as kb
 import notifier
@@ -106,18 +108,21 @@ class SiteProbeTests(unittest.IsolatedAsyncioTestCase):
                 '<div class="m-attention__text">' + DNIPRO_NOW + '</div>'
                 '<script>DisconSchedule.fact = {"data": {}, "update": "20.11.2026 13:35", "today": 1}</script></body></html>')
 
-        def respond(request):
-            if request.method == "GET":
-                return httpx.Response(200, text=page)
-            form = dict(httpx.QueryParams(request.content.decode()))
-            posts.append((form, request.headers.get("x-csrf-token")))
-            return httpx.Response(200, json=street_payload() if form["data[1][value]"] == "вул. Микитинська" else {"data": {}})
+        def respond(method, url, form):
+            if method == "GET":
+                return 200, page
+            return 200, street_payload() if form["data[1][value]"] == "вул. Микитинська" else {"data": {}}
 
-        async_client = httpx.AsyncClient
-        with patch.object(dtek_site.httpx, "AsyncClient", side_effect=lambda **kw: async_client(
-            **{**kw, "transport": httpx.MockTransport(respond)},
-        )), patch.object(dtek_site.asyncio, "sleep", AsyncMock()):
+        with fake_dtek(respond) as s, patch.object(dtek_site.asyncio, "sleep", AsyncMock()) as sleep:
             result = await dtek_site.probe(["вул. Микитинська", "вул. Неіснуюча"])
+        posts = [(form, headers.get("X-CSRF-Token")) for method, _, form, headers in s.calls if method == "POST"]
+        ajax_headers = [headers for method, _, _, headers in s.calls if method == "POST"][0]
+        self.assertEqual(ajax_headers["X-Requested-With"], "XMLHttpRequest")
+        self.assertEqual(ajax_headers["Origin"], "https://www.dtek-dnem.com.ua")
+        self.assertTrue(ajax_headers["Referer"].endswith("/ua/shutdowns"))
+        self.assertTrue(ajax_headers["Accept-Language"].startswith("uk-UA"))
+        pause = sleep.await_args.args[0]
+        self.assertTrue(3 <= pause <= 5, pause)  # бережно: 3–5 с між запитами
         self.assertEqual(len(result.houses), 6)
         self.assertEqual(result.failed, ["вул. Неіснуюча"])
         self.assertTrue(emergency_in_city(result.attention))
@@ -128,12 +133,15 @@ class SiteProbeTests(unittest.IsolatedAsyncioTestCase):
                          ("м. Дніпро", "вул. Микитинська", "20.11.2026 13:35"))
 
     async def test_antibot_page_is_an_error(self):
-        async_client = httpx.AsyncClient
-        with patch.object(dtek_site.httpx, "AsyncClient", side_effect=lambda **kw: async_client(
-            **{**kw, "transport": httpx.MockTransport(lambda r: httpx.Response(200, text='<iframe src="/_Incapsula_Resource">'))},
-        )):
-            with self.assertRaises(ValueError):
+        with fake_dtek(lambda m, u, f: (200, '<iframe src="/_Incapsula_Resource">')) as s:
+            with self.assertRaises(dtek_http.DtekError):
                 await dtek_site.probe(["вул. Микитинська"])
+            # пауза DTEK_BACKOFF_SEC: наступна спроба не йде в мережу зовсім
+            self.assertGreater(dtek_http.backoff_left(), 1700)
+            n = len(s.calls)
+            with self.assertRaises(dtek_http.Backoff):
+                await dtek_site.probe(["вул. Микитинська"])
+            self.assertEqual(len(s.calls), n)
 
 
 class DbTestCase(unittest.IsolatedAsyncioTestCase):
@@ -164,17 +172,22 @@ class DbTestCase(unittest.IsolatedAsyncioTestCase):
 
 class SiteAlertTests(DbTestCase):
     async def check(self, payload):
-        await dtek_site.apply(dtek_site.Probe(dtek_site.parse_houses("вул. Микитинська", payload)))
+        houses = dtek_site.parse_houses("вул. Микитинська", payload)
+        await dtek_site.apply(dtek_site.Probe(houses))
+        await dtek_site.record_incidents(houses)
         await notifier.send_alerts(self.bot)
+        await notifier.send_incidents(self.bot)
         return self.sent()
 
     async def test_group_gets_pushed_and_now_says_no_power(self):
         sent = await self.check(street_payload())
-        self.assertEqual([uid for uid, _ in sent], [1])  # лише ДТЕК 1.2; ні 3.1, ні ЦЕК 1.2
+        # одне зведене на (група, причина, кінець): 3 будинки з тим самим — одне повідомлення; ні 3.1, ні ЦЕК 1.2
+        self.assertEqual([uid for uid, _ in sent], [1])
         text = sent[0][1]
-        self.assertIn("Екстрене відключення</b> · група <b>1.2", text)
-        self.assertIn(f"з 13:16, орієнтовно до <b>17:16 {TS}", text)
-        self.assertIn("3 з 4", text)
+        self.assertIn("аварія на адресах групи · група 1.2", text)
+        self.assertIn("екстрене відключення", text)
+        self.assertIn("Орієнтовно до <b>17:16", text)
+        self.assertIn("вул. Микитинська", text)
         self.assertIn("сайт ДТЕК", text)
 
         now = await self.verdict()
@@ -182,6 +195,7 @@ class SiteAlertTests(DbTestCase):
         self.assertIn("екстрене відключення", now)
         self.assertIn("до <b>17:16", now)
         self.assertIn("🚨 Офіційно (сайт ДТЕК): екстрене у 3 з 4 перевірених адрес групи", now)
+        self.assertIn("🚧 Аварія по групі 1.2: екстрене відключення · вул. Микитинська, до <b>17:16", now)
         self.assertNotIn("локальна аварія", now)
 
         self.assertEqual(await self.check(street_payload()), [])  # той самий стан — без повторів
@@ -189,15 +203,23 @@ class SiteAlertTests(DbTestCase):
         sent = await self.check(street_payload(end=f"19:00 {T}"))
         self.assertEqual(len(sent), 1)
         self.assertIn("продовжено", sent[0][1])
+        self.assertIn("до <b>19:00", sent[0][1])
 
         self.assertEqual(await self.check(street_payload(off_12=0)), [])  # одна перевірка — ще не віримо
         sent = await self.check(street_payload(off_12=0))
         self.assertEqual([uid for uid, _ in sent], [1])  # офіційне «дали» — одразу, без 5 хв очікування
         self.assertIn("закінчилось", sent[0][1])
-        self.assertNotIn("Світла немає", await self.verdict())
+        now = await self.verdict()
+        self.assertNotIn("Світла немає", now)
+        self.assertNotIn("🚧", now)  # на вулиці аварії вже немає — інцидент закрито
 
-    async def test_one_house_of_many_is_not_a_group_outage(self):
+    async def test_one_house_of_many_sends_one_group_summary(self):
+        """Аварія з часом ремонту хоч в одному будинку — групі одне зведене (а не «екстрене по групі»)."""
         data = {str(n): house() for n in range(1, 11)} | {"11": house(EMERGENCY, f"13:16 {D}", f"17:16 {T}")}
+        sent = await self.check({"data": data})
+        self.assertEqual([uid for uid, _ in sent], [1])
+        self.assertIn("Можуть вимкнути не всю групу", sent[0][1])
+        self.assertNotIn("3 з 4", sent[0][1])
         self.assertEqual(await self.check({"data": data}), [])
 
     async def test_people_saying_on_during_official_outage(self):

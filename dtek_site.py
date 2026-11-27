@@ -1,32 +1,32 @@
-"""Сайт ДТЕК, «Перевірити адресу»: що зараз із контрольними адресами кожної групи.
+"""Сайт ДТЕК, «Перевірити адресу»: будинки вулиць, де є підписники, і їх черги.
 
 Сайт на запит вулиці (POST /ua/ajax, method=getHomeNum) віддає всі її будинки:
     {"14": {"sub_type": "Екстренні відключення (Аварійне без застосування графіку погодинних відключень)",
-            "start_date": "13:16 20.11.2026", "end_date": "17:16 20.11.2026", "sub_type_reason": ["GPV1.2"], ...}}
-Тобто по кожному будинку видно його чергу і чи є зараз світло. Кілька довгих вулиць у різних районах —
-це контрольні адреси всіх груп: бот бачить «по групі 1.2 вимкнули екстрено» раніше, ніж напишуть канали.
+            "start_date": "13:16 20.11.2026", "end_date": "17:16 20.11.2026", "sub_type_reason": ["GPV14.1"], ...}}
+Тобто по кожному будинку видно його чергу (будь-яку X.Y; буває й без черги) і чи є зараз світло.
+method=getStreets віддає перелік усіх вулиць: {"streets": {"м. Дніпро": ["вул. …", …], …}}.
 
-Перевірка вручну на сервері: python dtek_site.py [вулиця ...]
+Повний довідник вулиць і будинків збирає scripts/seed_streets.py; сервер опитує лише вулиці з підписниками.
+Перевірка вручну: python dtek_site.py [вулиця ...]
 """
 import asyncio
 import json
 import logging
+import random
 import re
 import sys
 import time
 from dataclasses import dataclass, field
-
-import random
-
-import httpx
+from datetime import datetime
 
 import dtek_http
-from config import DTEK_STREETS, GROUPS
+import groups as G
+from config import DTEK_BACKOFF_SEC, DTEK_POLL_PAUSE_MAX, DTEK_POLL_PAUSE_MIN, DTEK_STREETS, TZ
 
 log = logging.getLogger(__name__)
 
-PAGE_URL = "https://www.dtek-dnem.com.ua/ua/shutdowns"
-AJAX_URL = "https://www.dtek-dnem.com.ua/ua/ajax"
+PAGE_URL = dtek_http.PAGE_URL
+AJAX_URL = dtek_http.AJAX_URL
 CITY = "м. Дніпро"
 
 
@@ -78,33 +78,35 @@ def parse_houses(street: str, payload) -> list[House]:
     for num, h in (data or {}).items():
         if not isinstance(h, dict):
             continue
-        groups = set()
-        for reason in h.get("sub_type_reason") or []:
-            if (m := re.fullmatch(r"GPV([1-6]\.[12])", str(reason).strip())) and m.group(1) in GROUPS:
-                groups.add(m.group(1))
+        reasons = h.get("sub_type_reason") or []
+        groups = G.sort(g for r in (reasons if isinstance(reasons, list) else [reasons]) if (g := G.from_dtek_reason(r)))
         sub = str(h.get("sub_type") or "").strip()
         cek = h.get("cek")
         cek = "" if cek in (None, False, "", 0, "0") else (json.dumps(cek, ensure_ascii=False) if isinstance(cek, (dict, list)) else str(cek))
-        out.append(House(street, str(num), sorted(groups), classify(sub), sub,
+        out.append(House(street, str(num).strip(), groups, classify(sub), sub,
                          str(h.get("start_date") or "").strip(), str(h.get("end_date") or "").strip(), cek.strip()))
     return out
 
 
 def cek_group(h: House) -> str | None:
-    """З поля «cek» дістаємо чергу ЦЕК, якщо вона там є («2.1», «GPV1002.1», «ЦЕК 2.1»). Формат поля невідомий."""
-    if m := re.search(r"GPV100([1-6])\.([12])", h.cek):
-        return f"{m.group(1)}.{m.group(2)}"
-    m = re.search(r"(?<![\d.])([1-6])\.([12])(?![\d])", h.cek)
-    return f"{m.group(1)}.{m.group(2)}" if m else None
+    """З поля «cek» дістаємо чергу ЦЕК, якщо вона там є («2.1», «GPV1002.1», «ЦЕК 14.1»)."""
+    return G.from_cek(h.cek)
 
 
 def _form(street: str, update: str | None) -> dict[str, str]:
     fields = [("city", CITY), ("street", street)] + ([("updateFact", update)] if update else [])
-    data = {"method": "getHomeNum"}
-    for i, (name, value) in enumerate(fields):
-        data[f"data[{i}][name]"] = name
-        data[f"data[{i}][value]"] = value
-    return data
+    return dtek_http.ajax_form("getHomeNum", fields)
+
+
+def parse_streets_payload(payload, city: str = CITY) -> list[str]:
+    """Відповідь getStreets {"streets": {"м. Дніпро": [...], ...}} -> вулиці цього міста."""
+    data = payload.get("streets") if isinstance(payload, dict) else None
+    if isinstance(data, dict):
+        want = re.sub(r"\s+", " ", city).strip().lower()
+        data = next((v for k, v in data.items() if re.sub(r"\s+", " ", str(k)).strip().lower() == want), None)
+    if not isinstance(data, list):
+        return []
+    return [x.strip() for x in data if isinstance(x, str) and x.strip()]
 
 
 def parse_streets(html: str, city: str = CITY) -> list[str]:
@@ -127,79 +129,90 @@ def parse_streets(html: str, city: str = CITY) -> list[str]:
 
 
 class _Session:
-    """Сторінка (кукі + csrf + перелік вулиць) і запити «Перевірити адресу» в одному клієнті."""
+    """Сторінка (кукі + csrf + перелік вулиць) і запити «Перевірити адресу» в одній сесії curl_cffi.
+    use_backoff=False — для сідера довідника з ПК: він сам вирішує, скільки чекати після відмови."""
+
+    def __init__(self, use_backoff: bool = True):
+        self.use_backoff = use_backoff
 
     async def __aenter__(self):
         from providers import extract_attention
 
-        self.client = dtek_http.client()
-        try:
-            r = await dtek_http.request(self.client, "GET", PAGE_URL)
-            token = re.search(r'<meta[^>]+name="csrf-token"[^>]+content="([^"]+)"', r.text)
-            if not token or "DisconSchedule" not in r.text:
-                dtek_http.reset()
-                raise ValueError("сторінка ДТЕК без csrf/DisconSchedule — схоже, антибот")
-        except BaseException:
-            await self.client.aclose()
-            raise
+        r = await dtek_http.request("GET", PAGE_URL, use_backoff=self.use_backoff)
+        token = re.search(r'<meta[^>]+name="csrf-token"[^>]+content="([^"]+)"', r.text)
+        if not token or "DisconSchedule" not in r.text:
+            await dtek_http.reset()
+            if self.use_backoff:
+                dtek_http.backoff("сторінка без csrf/DisconSchedule")
+            raise dtek_http.Blocked("сторінка ДТЕК без csrf/DisconSchedule — схоже, антибот")
         update = re.search(r'DisconSchedule\.fact\s*=\s*\{.*?"update"\s*:\s*"([^"]+)"', r.text, re.S)
         self.update = update and update.group(1)
+        self.csrf = token.group(1)
         self.attention = extract_attention(r.text)
         self.streets = parse_streets(r.text)
-        self.headers = {"X-CSRF-Token": token.group(1), "X-Requested-With": "XMLHttpRequest", "Referer": PAGE_URL}
         return self
 
     async def __aexit__(self, *exc):
-        dtek_http.keep(self.client)
-        await self.client.aclose()
+        return False
 
-    async def houses(self, street: str) -> list[House]:
-        rr = await dtek_http.request(self.client, "POST", AJAX_URL, data=_form(street, self.update), headers=self.headers)
-        houses = parse_houses(street, rr.json())
-        await _cache_houses(street, houses)
+    async def street_list(self) -> list[str]:
+        """method=getStreets — повний перелік вулиць м. Дніпро."""
+        payload = await dtek_http.ajax({"method": "getStreets"}, self.csrf, use_backoff=self.use_backoff)
+        return parse_streets_payload(payload)
+
+    async def houses(self, street: str, cache: bool = True) -> list[House]:
+        payload = await dtek_http.ajax(_form(street, self.update), self.csrf, use_backoff=self.use_backoff)
+        if not payload.get("result", True) and not payload.get("data"):
+            raise ValueError(f"ДТЕК: вулиця {street} — result=false")
+        houses = parse_houses(street, payload)
+        if cache:
+            await _cache_houses(street, houses)
         return houses
 
 
 async def _cache_houses(street: str, houses: list[House]):
-    """Кожна успішна відповідь сайту -> кеш «вулиця -> будинки з чергами»: адреса знаходиться й тоді,
-    коли сайт закрився антиботом."""
+    """Кожна успішна відповідь сайту -> довідник «вулиця -> будинки з чергами»: адреса знаходиться без
+    запиту до сайту, навіть коли він закрився антиботом."""
     import db
 
     try:
         await db.save_houses(street, [(h.num, h.groups, h.cek) for h in houses])
-    except Exception as e:  # кеш — не привід зламати перевірку
-        log.warning("кеш будинків %s: %r", street, e)
+    except Exception as e:  # довідник — не привід зламати перевірку
+        log.warning("довідник будинків %s: %r", street, e)
 
 
 async def _remember_streets(streets: list[str]):
     import db
 
     if streets:
-        await db.kv_set("dtek_streets", json.dumps(streets, ensure_ascii=False))
+        await db.upsert_streets(streets)
 
 
-async def probe(streets: list[str] | None = None) -> Probe:
-    """Сторінка (кукі + csrf) -> по запиту на кожну вулицю. Сайт закрився антиботом — ValueError/HTTPError."""
-    streets = streets or DTEK_STREETS
+async def probe(streets: list[str] | None = None, pause: tuple[float, float] | None = None) -> Probe:
+    """Сторінка (кукі + csrf) -> по запиту на кожну вулицю з паузою pause (3–5 с) між ними.
+    Перша ж відмова сайту — зупиняємось (далі пауза DTEK_BACKOFF_SEC). Нічого не дав — DtekError/ValueError."""
+    streets = list(dict.fromkeys(streets or DTEK_STREETS))
+    if not streets:
+        raise ValueError("немає вулиць для перевірки")
+    lo, hi = pause or (DTEK_POLL_PAUSE_MIN, DTEK_POLL_PAUSE_MAX)
     out = Probe()
-    errors = 0
     async with _Session() as s:
         out.attention, out.streets = s.attention, s.streets
         for i, street in enumerate(streets):
+            if i:
+                await asyncio.sleep(lo + random.random() * max(hi - lo, 0))  # не пачкою і не рівним ритмом
             try:
                 houses = await s.houses(street)
-                errors = 0
-            except (httpx.HTTPError, ValueError) as e:
+            except dtek_http.DtekError as e:
+                log.warning("ДТЕК: вулиця %s — %r; решту вулиць не смикаємо", street, e)
+                out.failed += streets[i:]
+                break
+            except ValueError as e:
                 log.warning("ДТЕК: вулиця %s — %r", street, e)
                 houses = []
-                errors += 1
-                if errors >= 3:  # сайт почав відмовляти — не добиваємо його рештою вулиць
-                    out.failed += streets[i:]
-                    break
             if not houses:
                 out.failed.append(street)
             out.houses += houses
-            await asyncio.sleep(0.3 + random.random() * 0.5)  # не смикаємо сайт пачкою і не рівним ритмом
     await _remember_streets(out.streets)
     if not out.houses:
         raise ValueError(f"сайт ДТЕК не віддав жодного будинку ({len(streets)} вулиць)")
@@ -208,13 +221,15 @@ async def probe(streets: list[str] | None = None) -> Probe:
 
 # ---------- адреса користувача ----------
 
-BLOCK_SEC = 15 * 60  # сайт показав антибот — 15 хв не смикаємо його запитами людей (адреса -> кеш / «чекає»)
+BLOCK_SEC = DTEK_BACKOFF_SEC  # сайт показав антибот — 30 хв не смикаємо його запитами людей (адреса -> довідник / «чекає»)
 
 
 async def site_blocked() -> bool:
-    """Остання спроба (перевірка адрес чи пошук адреси людини) за 15 хв натрапила на антибот / 403."""
+    """Сайт зараз на паузі: остання спроба за DTEK_BACKOFF_SEC натрапила на помилку / антибот."""
     import db
 
+    if dtek_http.backoff_left():
+        return True
     s = json.loads(await db.kv_get("site_probe") or "null")
     return bool(s) and not s.get("ok") and time.time() - s.get("ts", 0) < BLOCK_SEC
 
@@ -226,11 +241,11 @@ async def mark_blocked(err: str):
 
 
 async def street_candidates(street_query: str) -> list[str]:
-    """Назва від людини -> назви вулиць ДТЕК: з переліку сайту (збережений у БД), без нього — здогадки."""
+    """Назва від людини -> назви вулиць ДТЕК: з довідника (dtek_streets), без нього — здогадки."""
     import db
     from address import guess_dtek_names, match_street
 
-    known = json.loads(await db.kv_get("dtek_streets") or "[]")
+    known = await db.street_names()
     if known:
         best = match_street(street_query, known)
         return [best] if best else []
@@ -243,34 +258,38 @@ class Lookup:
     house: House | None = None  # None — будинку немає в даних ДТЕК (можливо, ЦЕК)
     houses_on_street: int = 0
 
+    @property
+    def no_queue(self) -> bool:
+        """Будинок ДТЕК, у якого на сайті немає черги: стежимо за самим будинком."""
+        return bool(self.house) and not self.house.cek and not self.house.groups
+
 
 async def lookup_cached(street_query: str, house: str) -> Lookup | None:
-    """Те саме, що lookup, але з кешу будинків (сайт недоступний). None — цієї вулиці в кеші немає.
-    Стан будинку (є/нема світла) з кешу не знаємо — його покаже наступна перевірка сайту."""
+    """Те саме, що lookup, але з довідника — 0 запитів до сайту. None — цієї вулиці ще не опитували.
+    Стан будинку (є/нема світла) з довідника не знаємо — його покаже наступна перевірка сайту."""
     import db
-    from address import find_house
 
     for name in await street_candidates(street_query):
-        rows = await db.cached_houses(name)
-        if not rows:
-            continue
-        found = find_house({r["num"]: r for r in rows}, house)
-        if not found:
+        found = await db.find_house(name, house)
+        if found:
+            n = len(await db.cached_houses(name))
+            return Lookup(name, House(name, found["num"], found["groups"], None, cek=found["cek"]), n)
+        if rows := await db.cached_houses(name):
             return Lookup(name, None, len(rows))
-        num, r = found
-        return Lookup(name, House(name, num, r["groups"], None, cek=r["cek"]), len(rows))
+        if await db.street_polled(name):
+            return Lookup(name, None, 0)  # вулицю опитали — будинків ДТЕК на ній немає
     return None
 
 
 async def lookup(street_query: str, house: str) -> Lookup:
     """«Яворницького», «3» -> вулиця і будинок на сайті ДТЕК (з групою і поточним станом).
-    Сайт недоступний (антибот) — ValueError/HTTPError."""
+    Сайт недоступний (антибот / пауза) — dtek_http.DtekError або ValueError."""
     import db
     from address import find_house, guess_dtek_names, match_street
 
     async with _Session() as s:
         await _remember_streets(s.streets)
-        known = s.streets or json.loads(await db.kv_get("dtek_streets") or "[]")
+        known = s.streets or await db.street_names()
         if known:
             best = match_street(street_query, known)
             candidates = [best] if best else []
@@ -279,7 +298,7 @@ async def lookup(street_query: str, house: str) -> Lookup:
         for name in candidates:
             try:
                 houses = await s.houses(name)
-            except (httpx.HTTPError, ValueError) as e:
+            except ValueError as e:
                 log.warning("ДТЕК: вулиця %s — %r", name, e)
                 continue
             if not houses:
@@ -353,10 +372,11 @@ async def apply_users(probe_: Probe, users: list[dict]) -> list[tuple[int, str]]
             {"kind": h.kind, "reason": reason(h) if h.kind else "", "start": h.start, "end": h.end, "ts": now,
              "groups": h.groups, "street": street, "num": num}, ensure_ascii=False,
         ))
-        if h.groups and u.get("grp") and h.groups[0] != u["grp"]:  # ДТЕК переніс будинок в іншу чергу
+        if h.groups and h.groups[0] != u.get("grp"):  # ДТЕК переніс будинок в іншу чергу / дав чергу будинку без черги
             await db.set_user(u["id"], grp=h.groups[0])
+            was = f"було {u['grp']}" if u.get("grp") else "раніше черги не було"
             out.append((u["id"], f"ℹ️ За даними ДТЕК твій будинок ({street}, {num}) тепер у групі <b>{h.groups[0]}</b> "
-                                 f"(було {u['grp']}). Я оновив групу в налаштуваннях."))
+                                 f"({was}). Я оновив групу в налаштуваннях."))
         prev = json.loads(await db.kv_get(f"house:{u['id']}") or "null")
         if off:
             if not prev:
@@ -461,7 +481,7 @@ async def apply(probe_: Probe) -> list[str]:
     changes = []
     states = group_states(probe_.houses)
     by_key = {h.key: h for h in probe_.houses}
-    for grp in GROUPS:
+    for grp in G.sort(set(states) | set(G.known())):
         st = states.get(grp)
         if st:  # частку бачимо завжди — навіть нижче порогу пуша («🏠 екстрене у 30 з 265 адрес групи»)
             await db.kv_set(f"site_grp:{grp}", json.dumps(
@@ -481,7 +501,9 @@ async def apply(probe_: Probe) -> list[str]:
                 head = None
             if head:
                 key = f"site:off:{grp}:{st.start}:{st.end}"
-                if await db.add_alert(key, "off", grp, short_dt(st.end) or None, _off_text(grp, st, head), "dtek", "dteksite"):
+                # для «Зараз»; пуш групі шле інцидент (record_incidents -> notifier.send_incidents) — без дублів
+                if await db.add_alert(key, "off", grp, short_dt(st.end) or None, _off_text(grp, st, head), "dtek",
+                                      "dteksite", sent=1):
                     changes.append(f"{grp}: {head.lower()} до {st.end or '?'} ({len(st.off)}/{st.total})")
             await db.kv_set(f"site_em:{grp}", json.dumps(
                 {"start": st.start, "end": st.end, "houses": [h.key for h in st.off], "miss": 0}, ensure_ascii=False
@@ -509,7 +531,41 @@ async def apply(probe_: Probe) -> list[str]:
 
 def coverage(houses: list[House]) -> dict[str, int]:
     states = group_states(houses)
-    return {g: states[g].total if g in states else 0 for g in GROUPS}
+    return {g: states[g].total if g in states else 0 for g in G.sort(set(states) | set(G.known()))}
+
+
+# ---------- аварії з часом ремонту -> інциденти по чергах ----------
+
+INCIDENT_KINDS = ("emergency", "accident", "planned", "other")
+
+
+def dt_ts(s: str) -> int | None:
+    """«17:16 20.11.2026» -> unix-час (Київ)."""
+    try:
+        return int(datetime.strptime((s or "").strip(), "%H:%M %d.%m.%Y").replace(tzinfo=TZ).timestamp())
+    except ValueError:
+        return None
+
+
+async def record_incidents(houses: list[House]) -> int:
+    """Будинки з аварією і часом ремонту (end_date) -> group_incidents. Повертає, скільки нових інцидентів.
+    Сусідні вулиці з тим самим (черга, причина, кінець) — один інцидент, групі — одне сповіщення."""
+    import db
+
+    now, new, seen = time.time(), 0, set()
+    for h in houses:
+        if h.cek or h.kind not in INCIDENT_KINDS or not h.groups:
+            continue
+        end = dt_ts(h.end)
+        if not end or end <= now:
+            continue
+        for g in h.groups:
+            iid, is_new = await db.upsert_incident("dtek", g, h.street, reason(h), dt_ts(h.start), end)
+            seen.add(iid)
+            new += is_new
+    # на опитаних вулицях аварії вже немає (світло дали раніше) — інцидент закриваємо, «Зараз» його не показує
+    await db.end_incidents_except("dtek", {h.street for h in houses}, seen)
+    return new
 
 
 async def _main(streets):
@@ -520,7 +576,7 @@ async def _main(streets):
         off = f" · ЕКСТРЕНЕ {len(st.off)} (з {st.start} до {st.end})" if st.off else ""
         print(f"  {g}: {st.total} адрес{off}")
     missing = [g for g, n in coverage(p.houses).items() if not n]
-    print("Групи без контрольних адрес:", ", ".join(missing) or "немає — всі 12 покриті")
+    print("Групи без контрольних адрес:", ", ".join(missing) or "немає — всі покриті")
     other = {h.sub_type for h in p.houses if h.kind and h.kind != "emergency"}
     if other:
         print("Інші причини:", "; ".join(sorted(other)))

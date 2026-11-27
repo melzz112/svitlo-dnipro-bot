@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime
 
 from telethon import TelegramClient, events
@@ -20,6 +21,7 @@ from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInv
 from telethon.tl.types import ChatInviteAlready, PeerUser
 
 import db
+import groups as G
 from config import API_HASH, API_ID, CHANNELS, CHATS, TZ
 from parse import dedup_text, parse_channel, parse_schedule_posts, parse_user, ukey
 
@@ -87,10 +89,40 @@ async def backfill(client, channels, limit=40):
         await save_schedules(m.raw_text, m.date.astimezone(TZ))
 
 
+def incident_reason(text: str) -> str | None:
+    """Текст алерту каналу -> причина як у сайту ДТЕК («екстрене відключення»), щоб той самий випадок з каналу
+    і з сайту ДТЕК був одним інцидентом. Зміни графіка — не аварія (None)."""
+    from dtek_site import REASON_SHORT, classify
+
+    kind = classify(re.sub(r"<[^>]+>", " ", text))
+    if kind == "schedule":
+        return None
+    return REASON_SHORT.get(kind or "", "аварійне відключення")
+
+
+async def channel_incident(a, extension: bool) -> int:
+    """Аварія з каналу з часом «до …» -> group_incidents. -> sent для alerts: 1 — пуш групі шле інцидент
+    (send_incidents, без дублів із сайтом ДТЕК), 0 — пушимо алертом як раніше («продовжено/скорочено»)."""
+    from status import _until_dt
+
+    if a.kind != "off" or not a.until or not G.is_group(a.grp) or not (reason := incident_reason(a.text)):
+        return 0
+    end = _until_dt(a.until, int(time.time()))
+    if not end or end.timestamp() <= time.time():
+        return 0
+    iid, new = await db.upsert_incident(a.provider, a.grp, None, reason, int(time.time()), int(end.timestamp()))
+    if extension:  # «продовжено до …» — окремий алерт; зведене по цьому ж інциденту не шлемо
+        await db.mark_incident_notified(iid)
+        return 0
+    log.info("INCIDENT %s %s %s до %s (%s)", a.provider, a.grp, reason, a.until, "новий" if new else "вже є")
+    return 1
+
+
 async def _handle_post(raw: str):
-    """Пост каналу -> графіки в БД і/або alerts з антиспамом."""
+    """Пост каналу -> графіки в БД і/або alerts з антиспамом; аварії з часом — у group_incidents."""
     await save_schedules(raw, datetime.now(TZ))
     for a in parse_channel(raw):
+        extension = False
         if a.kind == "general":
             # загальних — не частіше раз на 30 хв (крім «скасовано»: це важливо)
             if "скасован" not in raw.lower() and await db.last_alert("general", "*", 30, a.provider):
@@ -101,9 +133,11 @@ async def _handle_post(raw: str):
                 shift = until_shift(a.until, prev["until"])
                 if abs(shift) < MIN_SHIFT_MIN:
                     continue  # дрібне уточнення часу — не смикаємо людей
+                extension = True
                 old_label = "Аварійне/екстрене відключення"
                 a.text = a.text.replace(old_label, "Відключення продовжено" if shift > 0 else "Відключення скорочено")
-        if await db.add_alert(alert_key(a, raw), a.kind, a.grp, a.until, a.text, a.provider):
+        sent = await channel_incident(a, extension)
+        if await db.add_alert(alert_key(a, raw), a.kind, a.grp, a.until, a.text, a.provider, sent=sent):
             log.info("ALERT %s %s %s %s", a.provider, a.kind, a.grp, a.until)
 
 
@@ -159,6 +193,16 @@ async def main():
                 print(f"{d.id:>16}  {d.name}")
         return
 
+    async def refresh_groups():
+        """Нові черги (14.1, 18.1…) бот бачить у даних ДТЕК/YASNO — підтягуємо їх для розбору текстів."""
+        while True:
+            await asyncio.sleep(600)
+            try:
+                await db.load_known_groups()
+            except Exception as e:
+                log.warning("черги з БД: %r", e)
+
+    asyncio.create_task(refresh_groups())
     channels, discussions = await resolve(client, CHANNELS)
     await backfill(client, channels)
     user_chats = discussions

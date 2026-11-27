@@ -2,7 +2,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from config import GROUPS
+import groups as G
 
 
 class Nav(CallbackData, prefix="nav"):
@@ -41,16 +41,19 @@ def main_menu():
     return b.as_markup()
 
 
-def groups_kb(current: str | None, provider: str = "dtek"):
+def groups_kb(current: str | None, provider: str = "dtek", groups: list[str] | None = None, back: bool | None = None):
+    """Кнопки черг будуються з даних (groups.known(): 1.1 … 18.1+), по 4 в ряд; поточна — завжди є."""
+    codes = G.sort(list(groups or G.known()) + ([current] if current and G.is_group(current) else []))
     b = InlineKeyboardBuilder()
     for code, name in (("dtek", "ДТЕК"), ("cek", "ЦЕК")):
         b.button(text=f"✅ {name}" if code == provider else name, callback_data=SetProvider(code=code))
-    for g in GROUPS:
+    for g in codes:
         b.button(text=f"✅ {g}" if g == current else g, callback_data=SetGroup(code=g))
     b.button(text="📍 Не знаю групу — визначити за адресою", callback_data=Nav(to="addr"))
-    if current:
+    back = bool(current) if back is None else back
+    if back:
         _back(b)
-    b.adjust(2, 4, 4, 4, 1, 1)
+    b.adjust(2, *[4] * ((len(codes) + 3) // 4), 1, *([1] if back else []))
     return b.as_markup()
 
 
@@ -104,7 +107,8 @@ def report_kb():
 def settings_kb(user: dict):
     b = InlineKeyboardBuilder()
     prov = "ЦЕК" if user.get("provider") == "cek" else "ДТЕК"
-    b.button(text=f"🔢 {prov} · група {user['grp'] or '—'}", callback_data=Nav(to="groups"))
+    grp = user["grp"] or ("без черги" if user.get("street") and user.get("house") else "—")
+    b.button(text=f"🔢 {prov} · група {grp}", callback_data=Nav(to="groups"))
     b.button(
         text="🔔 Сповіщення: увімк" if user["notify_on"] else "🔕 Сповіщення: вимк",
         callback_data=Notify(value=0),

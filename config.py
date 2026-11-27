@@ -22,34 +22,21 @@ CHATS = _list("CHATS")  # додаткові чати, де пишуть люд�
 ADMIN_IDS = [int(x) for x in _list("ADMIN_IDS") if x.lstrip("-").isdigit()]  # Telegram ID тих, кому доступна /stats
 CROWD_MIN = int(os.getenv("CROWD_MIN") or 3)  # скільки різних людей за 15 хв = «люди пишуть, що дали»
 
-GROUPS = [f"{q}.{s}" for q in range(1, 7) for s in (1, 2)]  # 1.1 … 6.2
+from groups import DEFAULT as GROUPS  # noqa: E402 — типові 1.1 … 6.2; реальні черги (до 18.1+) — groups.known()
 
-# «Перевірити адресу» на сайті ДТЕК: які вулиці дивитись. Сайт віддає по кожному будинку його чергу і чи є зараз
-# світло (і чому нема — «Екстренні відключення…»), тож кілька довгих вулиць у різних районах = контрольні адреси
-# всіх груп. Назви — точно як у полі «Введіть вулицю» на сайті. Яких груп бракує — видно в логах і в
-# `python dtek_site.py`.
-DTEK_STREETS = _list("DTEK_STREETS") or [
-    "вул. Микитинська",
-    "просп. Дмитра Яворницького",
-    "просп. Олександра Поля",
-    "просп. Слобожанський",
-    "просп. Богдана Хмельницького",
-    "просп. Героїв",
-    "просп. Науки",
-    "просп. Мануйлівський",
-    "просп. Праці",
-    "вул. Робоча",
-    "вул. Березинська",
-    "вул. Велика Діївська",
-    "вул. Космічна",
-    "вул. Тополина",
-    "вул. Калинова",
-    "вул. Набережна Перемоги",
-]
-# як часто перевіряти (0 — вимкнути). 15 хв: раз на 3 хв (сторінка + запит на кожну вулицю) сайт закрив сервер
-# антиботом Incapsula, а потім 403 — частіше не смикаємо
-DTEK_PROBE_SEC = int(os.getenv("DTEK_PROBE_SEC") or 900)
-# Проксі лише для сайту ДТЕК (Incapsula блокує IP дата-центрів): http://user:pass@host:port або socks5://…
+# Сайт ДТЕК, «Перевірити адресу». Повний довідник вулиць і будинків збирає scripts/seed_streets.py (з ПК з
+# українським IP) у таблиці dtek_streets / dtek_houses; на сервері сайт смикаємо бережно:
+# - лише вулиці, де є підписники (адреси людей, будинки без черги, адреси «⏳ чекає на сайт»);
+# - раз на DTEK_POLL_INTERVAL_SEC, з паузою DTEK_POLL_PAUSE_MIN…MAX с між запитами;
+# - помилка чи антибот -> DTEK_BACKOFF_SEC тиші (жодного запиту до сайту).
+DTEK_STREETS = _list("DTEK_STREETS")  # додаткові контрольні вулиці (за замовчуванням — жодної)
+DTEK_POLL_INTERVAL_SEC = int(os.getenv("DTEK_POLL_INTERVAL_SEC") or 1800)
+if os.getenv("DTEK_PROBE_SEC", "").strip() == "0":  # стара змінна: лише «0 — вимкнути»; 900 з неї вже не діє
+    DTEK_POLL_INTERVAL_SEC = 0
+DTEK_POLL_PAUSE_MIN = float(os.getenv("DTEK_POLL_PAUSE_MIN") or 3)
+DTEK_POLL_PAUSE_MAX = float(os.getenv("DTEK_POLL_PAUSE_MAX") or 5)
+DTEK_BACKOFF_SEC = int(os.getenv("DTEK_BACKOFF_SEC") or 1800)
+# Проксі не потрібен (curl_cffi з відбитком Chrome); лишено як опцію: http://user:pass@host:port або socks5://…
 DTEK_PROXY = os.getenv("DTEK_PROXY", "").strip() or None
 
 # Райони/масиви Дніпра для розпізнавання в чатах (укр + рос + сленг з чатів).

@@ -246,6 +246,8 @@ async def verdict(grp: str, provider: str) -> str:
         lines.append(f"🚨 Офіційно ({src}): {_label(alert['text'])}{till}")
         if alert.get("src") == "dteksite" and (m := re.search(r"🏠 ([^\n]*)", alert["text"])):
             lines.append(f"🏠 {m.group(1)} (сайт ДТЕК)")
+    for inc in (await db.active_incidents(provider, grp, int(now.timestamp())))[:2]:
+        lines.append(incident_line(inc, now))  # аварія з часом ремонту на адресах групи (сайт ДТЕК / канали)
     if sensors := svitlobot.status_line(await svitlobot.group_state(provider, grp)):
         lines.append(sensors)  # фактичний стан за датчиками в будинках групи
     if city_em:
@@ -303,7 +305,19 @@ async def house_block(user: dict) -> str | None:
     if user.get("grp") and (share := await _group_share(user["grp"], now)):
         # у тебе на сайті чисто, а інші адреси групи вже під екстреним — часто це доходить і до тебе
         text += "\n⚠️ Але по групі вже є екстрене — можуть вимкнути й тебе:\n" + share
+    elif user.get("grp") and (inc := await db.active_incidents("dtek", user["grp"], int(now.timestamp()))):
+        text += "\n⚠️ " + incident_line(inc[0], now)
     return text
+
+
+def incident_until(inc: dict, now: datetime) -> str:
+    return _short_until(datetime.fromtimestamp(inc["end_time"], TZ).strftime("%H:%M %d.%m"), now)
+
+
+def incident_line(inc: dict, now: datetime) -> str:
+    """«🚧 Аварія по групі 14.1: аварійні ремонтні роботи · вул. Березинська, до 18:00»."""
+    where = f" · {escape(inc['street_name'])}" if inc.get("street_name") else ""
+    return f"🚧 Аварія по групі {inc['group_name']}: {escape(inc['reason'])}{where}, до <b>{incident_until(inc, now)}</b>"
 
 
 def _short_until(until: str, now: datetime) -> str:

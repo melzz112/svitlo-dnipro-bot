@@ -6,17 +6,18 @@ import time
 from datetime import datetime
 from html import escape
 
-import httpx
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError
 
 import db
+import dtek_http
 import dtek_site
 import keyboards as kb
 import providers
 import status
 import svitlobot
-from config import CITY, CROWD_MIN, DTEK_PROBE_SEC, SOURCE, SVITLOBOT_ENABLED, SVITLOBOT_POLL_INTERVAL, TZ
+from config import (CITY, CROWD_MIN, DTEK_POLL_INTERVAL_SEC, DTEK_STREETS, SOURCE, SVITLOBOT_ENABLED,
+                    SVITLOBOT_POLL_INTERVAL, TZ)
 from providers import get_schedule
 from render import day_text, hm, now_h, now_status
 
@@ -65,6 +66,7 @@ async def tick(bot: Bot):
     initialized = await db.kv_get("sched_init") is not None  # перший прохід після деплою — без пушів
 
     schedules = await asyncio.gather(*(providers.get_schedule_days(prov, today=today) for prov in db.PROVIDERS))
+    yasno_changes = providers.drain_schedule_changes()  # детектор знімків YASNO (обидва постачальники)
     for prov, days in zip(db.PROVIDERS, schedules):
         name = db.PROVIDER_NAME[prov]
         emergency = await db.get_emergency(prov)
@@ -87,8 +89,8 @@ async def tick(bot: Bot):
                     continue
                 await db.kv_set(key, new)
                 await db.kv_set(src_key, schedule.source)
-                if not initialized:
-                    continue
+                if not initialized or schedule.source == "yasno":
+                    continue  # зміни YASNO по чергах шле детектор знімків (send_schedule_changes) — без дублів
                 title = "Сьогодні" if day == "today" else "Завтра"
                 if old is None:
                     head = f"📅 <b>{name}: з'явився графік на {title.lower()}</b>"
@@ -103,6 +105,9 @@ async def tick(bot: Bot):
         if not initialized and any(schedule.groups for schedule in days.values()):
             await db.kv_set("sched_init", "1")
 
+        for c in yasno_changes:
+            if c.provider == prov and c.date in dates.values():
+                changes.setdefault(c.grp, []).append(change_text(c, name, emergency and c.day == "today"))
         for u in users:
             if not u["notify_on"] or _prov(u) != prov:
                 continue
@@ -118,6 +123,25 @@ async def tick(bot: Bot):
                     await _send(
                         bot, u["id"], f"🔔 Через {int(left)} хв вимкнуть світло ({hm(s.start)}–{hm(s.end)}). Заряджай павербанк!"
                     )
+
+
+def change_text(c, name: str, emergency: bool = False) -> str:
+    """Зміна графіка черги з YASNO -> текст пуша: було / стало / що додали й прибрали."""
+    title = "Сьогодні" if c.day == "today" else "Завтра"
+    if c.old is None:
+        head = f"📅 <b>{name}: з'явився графік на {title.lower()}</b> · група <b>{c.grp}</b>"
+    else:
+        head = (f"🔄 <b>{name}: графік на {title.lower()} змінився</b> · група <b>{c.grp}</b>\n"
+                f"Було: {_slots_str(c.old)}\nСтало: <b>{_slots_str(c.new)}</b>")
+        if c.added:
+            head += f"\n➕ Додали: {_slots_str(c.added)}"
+        if c.removed:
+            head += f"\n➖ Прибрали: {_slots_str(c.removed)}"
+    text = f"{head}\n\n{day_text(c.grp, c.new, title)}\n\n"
+    text += f"🕒 Оновлено {escape(c.updated)} · сайт YASNO" if c.updated else "ℹ️ Джерело: сайт YASNO"
+    if emergency:
+        text += "\n\n🚨 Зараз діють екстрені відключення — вони можуть бути поза цим графіком."
+    return text
 
 
 ON_HOLD_SEC = 5 * 60  # «світло дали» з каналів чекає 5 хв, щоб звірити з чатами
@@ -285,11 +309,9 @@ async def emergency_check(bot: Bot):
                 await asyncio.sleep(0.05)
 
 
-SITE_FAIL_SEC = 15 * 60  # сайт закрився антиботом — пробуємо знову за 15 хв, не смикаємо його
 _site_next = 0.0
 _site_warned = 0.0
-_site_fails = 0
-MAX_USER_STREETS = 30  # скільки вулиць користувачів перевіряти за раз (решта — наступного разу, по колу)
+MAX_USER_STREETS = 30  # скільки вулиць підписників перевіряти за раз (решта — наступного разу, по колу)
 
 
 async def _finish_address(u: dict, street: str, h) -> str:
@@ -311,33 +333,42 @@ async def _finish_address(u: dict, street: str, h) -> str:
             "Тепер стежу за ним на сайті ДТЕК і напишу, щойно буде аварія, продовження чи світло повернеться.")
 
 
-async def site_check(bot: Bot):
-    """Сайт ДТЕК, «Перевірити адресу» по контрольних вулицях (раз на DTEK_PROBE_SEC) -> екстрене по групах ->
-    alerts, які send_alerts розсилає тут же. Так «по групі 1.2 вимкнули екстрено» доходить за хвилину."""
-    global _site_next, _site_warned, _site_fails
-    if not DTEK_PROBE_SEC or SOURCE != "dtek" or CITY != "dnipro" or time.monotonic() < _site_next:
-        return
-    _site_next = time.monotonic() + DTEK_PROBE_SEC
-    # контрольні вулиці + вулиці людей, які вказали адресу (по одному запиту на вулицю, хоч скільки там людей)
+async def subscriber_streets() -> tuple[list[str], list[dict], list[dict], dict[int, list[str]]]:
+    """Вулиці, де є підписники: адреси людей (і будинки без черги) + адреси «⏳ чекає на сайт» (першими).
+    -> (вулиці, люди з адресою, люди, що чекають, кандидати вулиць для тих, хто чекає)."""
     addr_users = await db.users_with_address()
     user_streets = list(dict.fromkeys(u["street"] for u in addr_users))
     if len(user_streets) > MAX_USER_STREETS:  # по колу, щоб усі вулиці перевірялись
-        shift = int(time.time() // max(DTEK_PROBE_SEC, 1)) % len(user_streets)
+        shift = int(time.time() // max(DTEK_POLL_INTERVAL_SEC, 1)) % len(user_streets)
         user_streets = (user_streets[shift:] + user_streets[:shift])[:MAX_USER_STREETS]
-    # адреси, які люди вводили, поки сайт не пускав: їх вулиці — першими
     pending = await db.users_addr_pending()
     cands = {u["id"]: await dtek_site.street_candidates(u["addr_q"].partition("|")[0]) for u in pending}
     pending_streets = [st for c in cands.values() for st in c]
-    streets = list(dict.fromkeys(pending_streets + user_streets + list(dtek_site.DTEK_STREETS)))
+    streets = list(dict.fromkeys(pending_streets + user_streets + list(DTEK_STREETS)))
+    return streets, addr_users, pending, cands
+
+
+async def site_check(bot: Bot):
+    """Сайт ДТЕК, «Перевірити адресу» — бережно: раз на DTEK_POLL_INTERVAL_SEC (30 хв), лише вулиці з
+    підписниками, 3–5 с між запитами; відмова сайту -> DTEK_BACKOFF_SEC тиші. Будинки людей -> особисті пуші;
+    аварії з часом ремонту -> group_incidents (send_incidents шле групі одне зведене сповіщення)."""
+    global _site_next, _site_warned
+    if not DTEK_POLL_INTERVAL_SEC or SOURCE != "dtek" or CITY != "dnipro" or time.monotonic() < _site_next:
+        return
+    if left := dtek_http.backoff_left():
+        _site_next = time.monotonic() + left
+        return
+    _site_next = time.monotonic() + DTEK_POLL_INTERVAL_SEC
+    streets, addr_users, pending, cands = await subscriber_streets()
+    if not streets:
+        return  # підписників з адресою немає — сайт не смикаємо зовсім
     try:
         probe = await dtek_site.probe(streets)
-    except (httpx.HTTPError, ValueError) as e:
-        _site_fails += 1  # 15 хв, 30, 60 — і далі раз на годину, поки сайт не оживе
-        _site_next = time.monotonic() + min(SITE_FAIL_SEC * 2 ** (_site_fails - 1), 3600)
+    except dtek_http.ERRORS as e:
+        _site_next = time.monotonic() + max(dtek_http.backoff_left(), DTEK_POLL_INTERVAL_SEC)
         log.warning("сайт ДТЕК: перевірка адрес не вдалась: %r", e)
         await db.kv_set("site_probe", json.dumps({"ok": False, "ts": int(time.time()), "err": str(e)[:80]}, ensure_ascii=False))
         return
-    _site_fails = 0
     await db.kv_set("site_probe", json.dumps({"ok": True, "ts": int(time.time()), "houses": len(probe.houses)}))
     providers.set_notice("dtek", probe.attention)  # заодно свіже вікно «Шановні клієнти!»
     for u, street, h in dtek_site.resolve_pending(probe, pending, cands):
@@ -348,14 +379,50 @@ async def site_check(bot: Bot):
     for uid, text in await dtek_site.apply_users(probe, addr_users):
         await _send(bot, uid, text)
         await asyncio.sleep(0.05)
-    if time.monotonic() - _site_warned > 3600:
+    if n := await dtek_site.record_incidents(probe.houses):
+        log.info("сайт ДТЕК: нових аварій по чергах: %d", n)
+    if time.monotonic() - _site_warned > 3600 and probe.failed:
         _site_warned = time.monotonic()
-        missing = [g for g, n in dtek_site.coverage(probe.houses).items() if not n]
-        if missing or probe.failed:
-            log.warning(
-                "сайт ДТЕК: немає контрольних адрес груп %s; вулиці без відповіді: %s — додай вулиці в DTEK_STREETS",
-                ", ".join(missing) or "—", ", ".join(probe.failed) or "—",
-            )
+        log.warning("сайт ДТЕК: вулиці без відповіді: %s", ", ".join(probe.failed))
+
+
+INCIDENT_MERGE_SEC = 60 * 60  # та сама причина по групі з кінцем у межах години — те саме відключення, не новина
+
+
+async def send_incidents(bot: Bot):
+    """Нові аварії по чергах -> одне зведене сповіщення всім підписникам черги на (черга, причина, кінець).
+    Сусідні вулиці / канал з тим самим — уже той самий інцидент (унікальний ключ у group_incidents);
+    кінець, зсунутий менше ніж на годину від уже розісланого, — теж не дублюємо. Жителям будинку, про який
+    уже прийшов особистий пуш, зведене не шлемо."""
+    for inc in await db.pending_incidents():
+        await db.mark_incident_notified(inc["id"])
+        prev = await db.notified_incidents(inc["operator"], inc["group_name"], inc["reason"], inc["id"])
+        if any(abs(x["end_time"] - inc["end_time"]) < INCIDENT_MERGE_SEC for x in prev):
+            continue  # той самий випадок з сусідньої вулиці / дрібне уточнення часу
+        head = None
+        if prev:  # той самий випадок, кінець зсунувся на годину і більше
+            head = "відключення продовжено" if inc["end_time"] > prev[0]["end_time"] else "відключення скорочено"
+        text = incident_text(inc, db.PROVIDER_NAME.get(inc["operator"], inc["operator"]), head)
+        for u in await db.users_in_group(inc["operator"], inc["group_name"]):
+            if await db.kv_get(f"house:{u['id']}"):  # про свій будинок людина вже отримала особистий пуш
+                continue
+            await _send(bot, u["id"], text)
+            await asyncio.sleep(0.05)
+        log.info("аварія %s %s: %s до %s — групі розіслано", inc["operator"], inc["group_name"], inc["reason"],
+                 datetime.fromtimestamp(inc["end_time"], TZ).strftime("%H:%M %d.%m"))
+
+
+def incident_text(inc: dict, name: str, head: str | None = None) -> str:
+    now = datetime.now(TZ)
+    title = f"{name}: {head}" if head else f"{name}: аварія на адресах групи"
+    lines = [f"🚧 <b>{title} · група {inc['group_name']}</b>", f"⚡ {escape(inc['reason'])}"]
+    if inc.get("street_name"):
+        lines.append(f"📍 {escape(inc['street_name'])}")
+    lines.append(f"⏱ Орієнтовно до <b>{status.incident_until(inc, now)}</b>")
+    lines.append("ℹ️ Можуть вимкнути не всю групу — лише частину адрес. Що з тобою — у «⚡ Зараз».")
+    src = "сайт ДТЕК (перевірка адрес)" if inc.get("street_name") else "Telegram-канали"
+    lines.append(f"\n<i>За даними: {src}</i>")
+    return "\n".join(lines)
 
 
 _svb_next = 0.0
@@ -395,7 +462,8 @@ async def loop(bot: Bot, every=60):
     """Сайт ДТЕК — раз на хвилину; аварії, «люди пишуть» і екстрені — кожні 15 с; графік — раз на хвилину."""
     n = 0
     while True:
-        for job in (site_check, svitlobot_check, send_alerts, crowd_check, emergency_check) + ((tick,) if n % 4 == 0 else ()):
+        for job in (site_check, svitlobot_check, send_alerts, send_incidents, crowd_check, emergency_check) + (
+                (tick,) if n % 4 == 0 else ()):
             try:
                 await job(bot)
             except Exception:
