@@ -422,7 +422,10 @@ async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str
         await db.kv_set(f"house_seen:{m.from_user.id}", "")
         wait = ("⏳ Сайт ДТЕК зараз не пускає бота — чи є світло в будинку, перевірю, щойно він відповість."
                 if await dtek_site.site_blocked() else
-                "ℹ️ Чи є зараз світло в будинку — перевірю на сайті ДТЕК найближчим часом.")
+                "ℹ️ Чи є зараз світло в будинку — перевіряю на сайті ДТЕК, за хвилину буде в «⚡ Зараз».")
+        if not await dtek_site.site_blocked():
+            dtek_site.poll_soon()  # не чекаємо планової перевірки (5–10 хв)
+            await db.kv_set("site_next_ts", str(int(time.time()) + 30))
         await m.answer(
             f"✅ <b>Знайшов!</b>\n🏠 {escape(res.street)}, {escape(h.num)}\n{grp_line}\n{wait}\n\n"
             "Далі я стежу за твоїм будинком на сайті ДТЕК і напишу, щойно буде аварія, продовження чи світло повернеться.",

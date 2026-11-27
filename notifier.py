@@ -348,17 +348,33 @@ async def subscriber_streets() -> tuple[list[str], list[dict], list[dict], dict[
     return streets, addr_users, pending, cands
 
 
+SOON_MIN_GAP = 60  # позапланова перевірка (людина вказала адресу) — не частіше раза на хвилину
+_site_last = -1e9
+
+
+async def _set_next(at_monotonic: float):
+    """Коли наступна перевірка — для «⚡ Зараз» («наступна ≈ 12:49»)."""
+    global _site_next
+    _site_next = at_monotonic
+    await db.kv_set("site_next_ts", str(int(time.time() + at_monotonic - time.monotonic())))
+
+
 async def site_check(bot: Bot):
-    """Сайт ДТЕК, «Перевірити адресу» — бережно: раз на DTEK_POLL_INTERVAL_SEC (30 хв), лише вулиці з
-    підписниками, 3–5 с між запитами; відмова сайту -> DTEK_BACKOFF_SEC тиші. Будинки людей -> особисті пуші;
-    аварії з часом ремонту -> group_incidents (send_incidents шле групі одне зведене сповіщення)."""
-    global _site_next, _site_warned
-    if not DTEK_POLL_INTERVAL_SEC or SOURCE != "dtek" or CITY != "dnipro" or time.monotonic() < _site_next:
+    """Сайт ДТЕК, «Перевірити адресу» — бережно: раз на 10 хв (під час аварій — 5), лише вулиці з
+    підписниками, 3–5 с між запитами; відмова сайту -> DTEK_BACKOFF_SEC тиші. Людина щойно вказала адресу —
+    позапланово (не частіше раза на хвилину). Будинки людей -> особисті пуші; аварії з часом ремонту ->
+    group_incidents (send_incidents шле групі одне зведене сповіщення)."""
+    global _site_warned, _site_last
+    if not DTEK_POLL_INTERVAL_SEC or SOURCE != "dtek" or CITY != "dnipro":
         return
+    if time.monotonic() < _site_next:
+        if time.monotonic() - _site_last < SOON_MIN_GAP or not dtek_site.take_poll_soon():
+            return
     if left := dtek_http.backoff_left():
-        _site_next = time.monotonic() + left
+        await _set_next(time.monotonic() + left)
         return
-    _site_next = time.monotonic() + DTEK_POLL_INTERVAL_SEC
+    _site_last = time.monotonic()
+    await _set_next(time.monotonic() + DTEK_POLL_INTERVAL_SEC)
     streets, addr_users, pending, cands = await subscriber_streets()
     if not streets:
         return  # підписників з адресою немає — сайт не смикаємо зовсім
@@ -366,7 +382,7 @@ async def site_check(bot: Bot):
     try:
         probe = await dtek_site.probe(streets)
     except dtek_http.ERRORS as e:
-        _site_next = time.monotonic() + max(dtek_http.backoff_left(), DTEK_POLL_INTERVAL_SEC)
+        await _set_next(time.monotonic() + max(dtek_http.backoff_left(), DTEK_POLL_INTERVAL_SEC))
         log.warning("сайт ДТЕК: перевірка адрес не вдалась: %r", e)
         await db.kv_set("site_probe", json.dumps({"ok": False, "ts": int(time.time()), "err": str(e)[:80]}, ensure_ascii=False))
         return
@@ -383,8 +399,7 @@ async def site_check(bot: Bot):
         await asyncio.sleep(0.05)
     if n := await dtek_site.record_incidents(probe.houses):
         log.info("сайт ДТЕК: нових аварій по чергах: %d", n)
-    interval = await poll_interval(addr_users)
-    _site_next = started + interval
+    await _set_next(started + await poll_interval(addr_users))
     if time.monotonic() - _site_warned > 3600 and probe.failed:
         _site_warned = time.monotonic()
         log.warning("сайт ДТЕК: вулиці без відповіді: %s", ", ".join(probe.failed))

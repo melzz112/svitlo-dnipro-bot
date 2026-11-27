@@ -232,6 +232,21 @@ async def probe(streets: list[str] | None = None, pause: tuple[float, float] | N
 
 # ---------- адреса користувача ----------
 
+_poll_soon = False
+
+
+def poll_soon():
+    """Людина щойно вказала адресу — notifier перевірить сайт позапланово (не частіше раза на хвилину)."""
+    global _poll_soon
+    _poll_soon = True
+
+
+def take_poll_soon() -> bool:
+    global _poll_soon
+    was, _poll_soon = _poll_soon, False
+    return was
+
+
 BLOCK_SEC = DTEK_BACKOFF_SEC  # сайт показав антибот — 30 хв не смикаємо його запитами людей (адреса -> довідник / «чекає»)
 
 

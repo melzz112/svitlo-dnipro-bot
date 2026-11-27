@@ -301,12 +301,17 @@ async def house_block(user: dict) -> str | None:
         probe = await _site_probe()
         if probe and not probe.get("ok"):  # остання перевірка справді впала
             return f"🏠 <b>Твій будинок</b> ({addr}): сайт ДТЕК зараз не відповідає — дивись нижче за групою"
-        nxt = ""
-        if probe and DTEK_POLL_INTERVAL_SEC:
-            at = datetime.fromtimestamp(probe["ts"] + DTEK_POLL_INTERVAL_SEC, TZ)
-            nxt = f", наступна ≈ {at:%H:%M}" if at > now else ""
-        every = f"раз на {DTEK_POLL_INTERVAL_SEC // 60} хв" if DTEK_POLL_INTERVAL_SEC else "періодично"
-        return (f"🏠 <b>Твій будинок</b> ({addr}): ще не перевіряв на сайті ДТЕК — перевіряю {every}{nxt}. "
+        planned = int(await db.kv_get("site_next_ts") or 0)
+        if not planned and probe and DTEK_POLL_INTERVAL_SEC:
+            planned = probe["ts"] + DTEK_POLL_INTERVAL_SEC
+        left = planned - now.timestamp()
+        if planned and left <= 90:
+            when = "перевіряю просто зараз — онови за хвилину"
+        elif planned:
+            when = f"наступна перевірка ≈ {datetime.fromtimestamp(planned, TZ):%H:%M}"
+        else:
+            when = "перевірю найближчим часом"
+        return (f"🏠 <b>Твій будинок</b> ({addr}): ще не перевіряв на сайті ДТЕК — {when}. "
                 "Поки дивись нижче за групою")
     ago = int(now.timestamp() - seen["ts"]) // 60
     checked = f"<i>сайт ДТЕК, {ago} хв тому</i>" if ago else "<i>сайт ДТЕК, щойно</i>"

@@ -442,3 +442,45 @@ class PollIntervalTests(DbCase):
             left = notifier._site_next - time.monotonic()
         self.assertTrue(250 < left <= 300, left)  # у будинку підписника зараз аварія -> раз на 5 хв
         notice.assert_not_called()  # сторінку не тягнули — вікно «Шановні клієнти!» не затираємо
+
+
+class PollSoonTests(DbCase):
+    async def test_new_address_triggers_check_once_a_minute(self):
+        await db.set_user(1, grp="14.1", provider="dtek", street="вул. Березинська", house="43")
+        houses = dtek_site.parse_houses("вул. Березинська", {"data": {"43": dtek_house("14.1")}})
+        probe = AsyncMock(return_value=dtek_site.Probe(houses))
+        with patch.object(dtek_site, "probe", probe), \
+                patch.multiple(notifier, _site_next=time.monotonic() + 500, SOURCE="dtek", CITY="dnipro"), \
+                patch.object(notifier.providers, "set_notice"):
+            await notifier.site_check(AsyncMock())
+            self.assertEqual(probe.await_count, 0)  # планова перевірка ще не скоро
+            dtek_site.poll_soon()
+            await notifier.site_check(AsyncMock())
+            self.assertEqual(probe.await_count, 1)  # людина вказала адресу — перевірили одразу
+            dtek_site.poll_soon()
+            await notifier.site_check(AsyncMock())
+            self.assertEqual(probe.await_count, 1)  # але не частіше раза на хвилину
+            planned = int(await db.kv_get("site_next_ts"))
+        self.assertTrue(550 <= planned - time.time() <= 600)  # наступна — за розкладом (10 хв)
+        self.assertIsNotNone(await db.kv_get("house_seen:1"))
+
+    async def test_now_screen_says_real_next_check(self):
+        await db.set_user(1, grp="14.1", provider="dtek", street="вул. Березинська", house="43")
+        u = await db.get_user(1)
+        await db.kv_set("site_probe", json.dumps({"ok": True, "ts": int(time.time()) - 60}))
+        await db.kv_set("site_next_ts", str(int(time.time()) + 240))
+        nxt = datetime.fromtimestamp(int(time.time()) + 240, TZ).strftime("%H:%M")
+        self.assertIn(f"наступна перевірка ≈ {nxt}", await status.house_block(u))
+        await db.kv_set("site_next_ts", str(int(time.time()) + 30))
+        self.assertIn("перевіряю просто зараз", await status.house_block(u))
+
+    async def test_binding_from_directory_asks_for_check(self):
+        await db.upsert_streets(["вул. Березинська"])
+        await db.save_houses("вул. Березинська", [("43", ["14.1"], "")])
+        await db.set_user(1)
+        state = FSMContext(storage=MemoryStorage(), key=StorageKey(bot_id=1, chat_id=1, user_id=1))
+        await state.set_state(handlers.Addr.waiting)
+        m = _Msg("Березинська 43")
+        await handlers.addr_text(m, state)
+        self.assertTrue(dtek_site.take_poll_soon())
+        self.assertTrue(any("за хвилину буде" in t for t, _ in m.answers))
