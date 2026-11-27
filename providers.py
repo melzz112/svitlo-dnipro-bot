@@ -12,6 +12,7 @@ from html import escape, unescape
 
 import httpx
 
+import dtek_http
 import groups as G
 from config import CITY, GROUPS, SOURCE, TZ
 from parse import emergency_in_city
@@ -314,7 +315,7 @@ async def _site_schedule(source: str, provider: str, today: date) -> dict[str, D
                     snapshot = await fetch_yasno(today, provider)
                 else:
                     snapshot = await fetch_outage_data_ua(today, provider)
-        except (httpx.HTTPError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        except (httpx.HTTPError, dtek_http.DtekError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as exc:
             log.warning("%s schedule for %s unavailable: %r", source, provider, exc)
             _site_cache[key] = (today, time.monotonic() + SITE_RETRY_SEC[source], None)
             return _stale(key, today)

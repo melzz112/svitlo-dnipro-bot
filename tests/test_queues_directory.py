@@ -310,6 +310,14 @@ async def _verdict(grp):
         return await status.verdict(grp, "dtek")
 
 
+class DtekPageBlockedTests(DbCase):
+    async def test_blocked_dtek_page_falls_back_quietly(self):
+        with patch.multiple(providers, SOURCE="dtek", _site_cache={}, _site_locks={}, _site_last_good={}),                 patch.object(providers, "fetch_yasno", AsyncMock(return_value={})),                 patch.object(providers, "fetch_outage_data_ua", AsyncMock(return_value={})),                 patch.object(providers, "fetch_dtek", AsyncMock(side_effect=dtek_http.Blocked("антибот"))),                 patch.object(providers, "channel_schedule", AsyncMock(return_value=DaySchedule())) as channel,                 self.assertLogs("providers", "WARNING"):
+            days = await providers.get_schedule_days("dtek", today=date(2026, 11, 20))
+        self.assertEqual(set(days), {"today", "tomorrow"})
+        channel.assert_awaited()
+
+
 class YasnoChangeTests(DbCase):
     async def test_detects_changes_per_queue_and_pushes_subscribers(self):
         today = datetime.now(TZ).date()
