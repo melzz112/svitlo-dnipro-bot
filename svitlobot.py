@@ -20,8 +20,6 @@ import aiohttp
 
 import groups as G
 
-import groups as G
-
 from config import (
     SVITLOBOT_CHANNELS_URL,
     SVITLOBOT_CITY_FILTER,
@@ -308,8 +306,63 @@ async def fetch_raw() -> str:
 
 
 async def fetch_points() -> list[Point]:
-    """Точки регіону з групами (з підпису або з svitlobot_groups.json)."""
-    return parse_channels(await fetch_raw(), mapping=groups_map())
+    """Точки міста з групами: спершу з довідника адрес ДТЕК (актуальна черга будинку), далі — з підпису
+    датчика чи svitlobot_groups.json (підписи бувають ще зі старої сітки 1.1–6.2)."""
+    return await resolve_points(await fetch_raw())
+
+
+DIR_TTL = 6 * 3600  # адреса точки -> черга з довідника: кеш на 6 год (точок сотні, опитуємо раз на 2 хв)
+_dir_cache: dict[str, tuple[bool, str | None, str | None]] = {}
+_dir_streets: list[str] = []
+_dir_ts = 0.0
+
+
+def split_address(address: str) -> tuple[str, str | None]:
+    """«Дніпро -> пр Слобожанський 19» -> («пр Слобожанський», «19»); «Магалевського 6 (п.1-3)» -> (…, «6»)."""
+    from address import parse_text_address
+
+    return parse_text_address(address.split("->", 1)[-1].split("(", 1)[0])
+
+
+async def directory_group(address: str) -> tuple[bool, str | None, str | None]:
+    """(будинок є в довіднику?, постачальник, черга або None — будинок без черги)."""
+    global _dir_ts, _dir_streets
+    import db
+    from address import match_street
+
+    if time.time() - _dir_ts > DIR_TTL:
+        _dir_cache.clear()
+        _dir_streets = await db.street_names()
+        _dir_ts = time.time()
+    if address in _dir_cache:
+        return _dir_cache[address]
+    res: tuple[bool, str | None, str | None] = (False, None, None)
+    street, house = split_address(address)
+    if street and house and _dir_streets and (name := match_street(street, _dir_streets)):
+        if h := await db.find_house(name, house):
+            res = (True, h["operator"], h["group_name"])
+    _dir_cache[address] = res
+    return res
+
+
+async def resolve_points(raw: str, mapping: dict | None = None, city: str = SVITLOBOT_CITY_FILTER) -> list[Point]:
+    mapping = groups_map() if mapping is None else mapping
+    rre = region_re()
+    city_re = region_re(city) if city and city.strip() else None
+    out = []
+    for line in raw.splitlines():
+        if not line.strip() or (p := parse_point(line, rre)) is None:
+            continue
+        if city_re and not city_re.search(city_of(p.address)):
+            continue
+        found, prov, grp = await directory_group(p.address)
+        if found:  # довідник — головне: будинок без черги в групах не рахуємо
+            p.provider, p.grp = prov, grp
+        elif not p.grp and p.slug in mapping:
+            p.provider, p.grp = mapping[p.slug]
+        if p.grp:
+            out.append(p)
+    return out
 
 
 # --- стан і зміни ---
