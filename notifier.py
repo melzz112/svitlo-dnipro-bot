@@ -58,11 +58,28 @@ async def in_quiet(uid: int) -> bool:
     return bool(u.get("quiet")) and _quiet_hour(datetime.now(TZ).hour)
 
 
+RATE_MAX, RATE_WINDOW = 6, 3600  # групових пушів на людину за годину; решту згортаємо в одне «ще N»
+_rate: dict[int, list[float]] = {}
+_skipped: dict[int, int] = {}
+
+
 async def _send(bot: Bot, uid: int, text: str, urgent: bool = False):
-    """urgent — аварія в самому будинку людини (і відповідь на її ж дію): іде й у тихі години."""
+    """urgent — аварія в самому будинку людини (і відповідь на її ж дію): іде й у тихі години і без ліміту."""
     if not urgent and await in_quiet(uid):
         await db.bump("quiet_skip")
         return
+    if not urgent:
+        now = time.time()
+        recent = [t for t in _rate.get(uid, []) if now - t < RATE_WINDOW]
+        if len(recent) >= RATE_MAX:
+            _rate[uid] = recent
+            _skipped[uid] = _skipped.get(uid, 0) + 1
+            await db.bump("rate_skip")
+            return
+        _rate[uid] = recent + [now]
+        if n := _skipped.pop(uid, 0):
+            text += (f"\n\nℹ️ Ще {n} {'оновлення' if n < 5 else 'оновлень'} за останню годину не надсилав, "
+                     "щоб не спамити, — актуальне завжди в «⚡ Зараз».")
     try:
         await bot.send_message(uid, text, reply_markup=kb.main_menu())
         await db.bump("push")
@@ -174,6 +191,20 @@ async def off_locked(prov: str, grp: str) -> bool:
 
 async def lock_off(prov: str, grp: str, src: str):
     await db.kv_set(f"offlock:{prov}:{grp}", json.dumps({"ts": int(time.time()), "src": src}))
+    await db.kv_set(f"onsent:{prov}:{grp}", "")  # нове відключення — наступне «дали» вже новина
+
+
+# «Дали світло / триває відновлення» — так само один раз: каналі шлють його по колу кожні 1–2 год (59 за добу).
+ON_REPEAT_SEC = 6 * 3600
+
+
+async def on_already(prov: str, grp: str) -> bool:
+    v = json.loads(await db.kv_get(f"onsent:{prov}:{grp}") or "null")
+    return bool(v) and time.time() - v.get("ts", 0) < ON_REPEAT_SEC
+
+
+async def mark_on(prov: str, grp: str):
+    await db.kv_set(f"onsent:{prov}:{grp}", json.dumps({"ts": int(time.time())}))
 
 
 async def unlock_off(prov: str, grp: str):
@@ -218,7 +249,14 @@ async def send_alerts(bot: Bot):
             # група вже знає — «люди пишуть» з тим самим не дублюємо
             await db.kv_set(f"{_pkey(prov, 'crowd')}:{a['grp']}", a["kind"])
             if a["grp"] != "*":
-                await (lock_off(prov, a["grp"], src) if a["kind"] == "off" else unlock_off(prov, a["grp"]))
+                if a["kind"] == "off":
+                    await lock_off(prov, a["grp"], src)
+                else:
+                    await unlock_off(prov, a["grp"])
+                    if await on_already(prov, a["grp"]):  # «триває відновлення» вже було — не повторюємо
+                        log.info("alert %s: тихо, група вже знає, що дають світло", a["key"])
+                        continue
+                    await mark_on(prov, a["grp"])
         for u in users:
             if _matches(prov, u) and (a["grp"] == "*" or a["grp"] == u["grp"]):
                 await _send(bot, u["id"], a["text"] + f"\n\n<i>{ALERT_FOOTER.get(src, ALERT_FOOTER['channel'])}</i>")
@@ -277,6 +315,10 @@ async def crowd_check(bot: Bot):
             await db.kv_set(f"{skey}_ts:{grp}", str(int(time.time())))
 
             if new == "on":
+                if await on_already(prov, grp):  # про «дали» група вже знає (канал / сайт / датчики)
+                    log.info("crowd %s %s -> on: тихо, група вже знає", prov, grp)
+                    continue
+                await mark_on(prov, grp)
                 what = "почали вмикати світло" if (n_off or official) else "дали світло"
                 head, n = f"💡 <b>Люди пишуть: {name} {grp} — {what}</b>", n_on
                 if official:
@@ -498,7 +540,10 @@ async def send_incidents(bot: Bot):
             continue  # той самий випадок з сусідньої вулиці / дрібне уточнення часу
         head = None
         if prev:  # той самий випадок, кінець зсунувся на годину і більше
-            head = "відключення продовжено" if inc["end_time"] > prev[0]["end_time"] else "відключення скорочено"
+            longer = inc["end_time"] > prev[0]["end_time"]
+            head = "відключення продовжено" if longer else "відключення скорочено"
+            if longer and (n := await db.extensions_today(inc["operator"], inc["group_name"], inc["reason"])) >= 2:
+                head += f" (вже {n}-й раз)"
         text = incident_text(inc, db.PROVIDER_NAME.get(inc["operator"], inc["operator"]), head)
         for u in await db.users_in_group(inc["operator"], inc["group_name"]):
             if await db.kv_get(f"house:{u['id']}"):  # про свій будинок людина вже отримала особистий пуш
@@ -556,6 +601,9 @@ async def svitlobot_check(bot: Bot):
             await lock_off(c.provider, c.grp, "svitlobot")
         else:
             await unlock_off(c.provider, c.grp)  # датчики бачать світло — наступне «вимкнули» вже новина
+            if await on_already(c.provider, c.grp):
+                continue
+            await mark_on(c.provider, c.grp)
         text = svitlobot.notify_text(c, db.PROVIDER_NAME[c.provider]) + "\n\n<i>За даними датчиків Світлобота</i>"
         for u in users:
             if u["grp"] == c.grp and _prov(u) == c.provider:

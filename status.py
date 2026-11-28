@@ -353,14 +353,35 @@ async def house_block(user: dict) -> str | None:
                 "Поки дивись нижче за групою")
     ago = int(now.timestamp() - seen["ts"]) // 60
     checked = f"<i>сайт ДТЕК, {ago} хв тому</i>" if ago else "<i>сайт ДТЕК, щойно</i>"
+    hours = await _outage_hours(user["id"], now)
     if seen.get("kind") and seen["kind"] != "schedule":
         end = re.match(r"(\d{1,2}:\d{2})(?:\s+(\d{2}\.\d{2}))?", seen.get("end") or "")
         until = f" до <b>{_short_until(' '.join(x for x in end.groups() if x), now)}</b>" if end else ""
-        return f"🏠 <b>Твій будинок</b> ({addr})\n🔴 {seen.get('reason') or 'відключення'}{until} · {checked}"
+        return f"🏠 <b>Твій будинок</b> ({addr})\n🔴 {seen.get('reason') or 'відключення'}{until} · {checked}{hours}"
     if seen.get("kind") == "schedule":
-        return f"🏠 <b>Твій будинок</b> ({addr})\n🔴 відключення за графіком · {checked}"
+        return f"🏠 <b>Твій будинок</b> ({addr})\n🔴 відключення за графіком · {checked}{hours}"
     # лише про сам будинок: що діється по групі (екстрене на інших адресах, аварії) — один раз, у «По групі»
-    return f"🏠 <b>Твій будинок</b> ({addr})\n✅ відключень немає · {checked}"
+    return f"🏠 <b>Твій будинок</b> ({addr})\n✅ відключень немає · {checked}{hours}"
+
+
+def _dur(sec: int) -> str:
+    h, m = sec // 3600, sec % 3600 // 60
+    return f"{h} год {m} хв" if h else f"{m} хв"
+
+
+async def _outage_hours(uid: int, now: datetime) -> str:
+    """«⏳ Без світла: сьогодні 5 год 20 хв · за 7 днів 18 год» — за перевірками сайту ДТЕК."""
+    from dtek_site import outage_seconds
+
+    log_ = json.loads(await db.kv_get(f"house_log:{uid}") or "[]")
+    if not log_:
+        return ""
+    ts = now.timestamp()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    today, week = outage_seconds(log_, midnight, ts), outage_seconds(log_, ts - 7 * 86400, ts)
+    if not week:
+        return ""
+    return f"\n⏳ Без світла: сьогодні {_dur(today) if today else '—'} · за 7 днів {_dur(week)}"
 
 
 def incident_until(inc: dict, now: datetime) -> str:

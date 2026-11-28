@@ -843,3 +843,91 @@ class ChatsVsSensorsTests(DbCase):
     async def test_sensors_off_keeps_no_power(self):
         await self.sensors("off")
         self.assertIn("🔴 <b>Світла немає</b>", await _verdict("14.1"))
+
+
+class ChatStreetTests(DbCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        import chat_streets
+        self.cs = chat_streets
+        await db.upsert_streets(["вул. Калинова", "вул. Тополина", "вул. Березинська", "вул. Робоча",
+                                 "просп. Дмитра Яворницького", "вул. Яворницького"])
+        await db.save_houses("вул. Тополина", [(str(n), ["14.1"], "") for n in range(1, 40)])
+        await db.save_houses("вул. Калинова", [(str(n), ["16.1"], "") for n in range(1, 40)])
+        await db.save_houses("вул. Березинська", [("45", ["14.1"], "")])
+        await db.save_houses("вул. Робоча", [("5", ["15.1"], ""), ("7", ["13.1"], "")])
+        await db.save_houses("просп. Дмитра Яворницького", [("50", ["18.1"], "")])
+        await db.save_houses("вул. Яворницького", [("2", ["17.1"], "")])
+        await chat_streets.index.build()
+
+    async def test_street_and_queue_from_text(self):
+        m = self.cs.index.match
+        self.assertEqual(await m("ул Тополиная 13 дали"), ("вул. Тополина", "14.1", "13"))
+        self.assertEqual(await m("вул. Калинова нема"), ("вул. Калинова", "16.1", None))
+        self.assertEqual(await m("Робоча 7 нема"), ("вул. Робоча", "13.1", "7"))
+        self.assertEqual(await m("Дмитра Яворницького 50 нема"), ("просп. Дмитра Яворницького", "18.1", "50"))
+        self.assertIsNone(await m("Яворницкого света нет"))  # і проспект, і вулиця — без будинку не вгадуємо
+        self.assertIsNone(await m("на роботі нема світла"))  # звичайне слово
+        self.assertIsNone(await m("на Березинке дали"))  # масив, а не вулиця
+        self.assertIsNone(await m("Тополь 3 нет света"))
+
+    async def test_old_group_replaced_by_street_queue(self):
+        res = {"event": "on", "groups": ["1.2"], "street": None, "district": None, "provider": ""}
+        out = await self.cs.apply(res, "1.2 березинская 45 дали")
+        self.assertEqual((out["groups"], out["street"]), (["14.1"], "вул. Березинська"))
+        kept = await self.cs.apply({**res, "groups": ["14.1"]}, "вул. Калинова 5 дали")
+        self.assertEqual(kept["groups"], ["14.1"])  # жива черга від людини — не чіпаємо
+        none = await self.cs.apply({**res, "groups": []}, "вул. Калинова дали")
+        self.assertEqual(none["groups"], ["16.1"])
+
+
+class RepeatOnTests(DbCase):
+    async def test_second_restoring_post_is_silent_until_new_outage(self):
+        G.register(NEW_QUEUES)
+        await db.set_user(1, grp="14.1", provider="dtek")
+
+        async def post(key, kind, text):
+            await db.add_alert(key, kind, "14.1", None if kind == "on" else "18:00", text)
+            await db._exec("UPDATE alerts SET ts=? WHERE key=?", (int(time.time()) - 600, key))  # без 5 хв очікування
+            bot = AsyncMock()
+            await notifier.send_alerts(bot)
+            return bot.send_message.await_count
+
+        self.assertEqual(await post("on1", "on", "✅ Група 14.1: триває відновлення"), 1)
+        self.assertEqual(await post("on2", "on", "✅ Група 14.1: триває відновлення"), 0)  # повтор
+        self.assertEqual(await post("off1", "off", "🚨 <b>Аварійне відключення</b> · група 14.1"), 1)
+        self.assertEqual(await post("on3", "on", "✅ Група 14.1: триває відновлення"), 1)  # після нового — знову
+
+
+class RateLimitTests(DbCase):
+    async def test_six_per_hour_then_summary(self):
+        await db.set_user(1, grp="14.1", provider="dtek")
+        bot = AsyncMock()
+        for i in range(9):
+            await notifier._send(bot, 1, f"оновлення {i}")
+        await notifier._send(bot, 1, "🏠 у будинку нема світла", urgent=True)  # про будинок — завжди
+        texts = [c.args[1] for c in bot.send_message.await_args_list]
+        self.assertEqual(len(texts), 7)
+        self.assertEqual(texts[-1], "🏠 у будинку нема світла")
+        notifier._rate[1] = [t - 3700 for t in notifier._rate[1]]  # минула година
+        await notifier._send(bot, 1, "нове")
+        self.assertIn("Ще 3 оновлення за останню годину не надсилав", bot.send_message.await_args.args[1])
+
+
+class OutageHoursTests(DbCase):
+    async def test_hours_today_and_week(self):
+        await db.set_user(1, grp="14.1", provider="dtek", street="вул. Микитинська", house="14")
+        now = int(time.time())
+        midnight = int(datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        start = max(midnight, now - 2 * 3600)
+        await db.kv_set("house_log:1", json.dumps([[now - 3 * 86400, now - 3 * 86400 + 5 * 3600], [start, None]]))
+        await db.kv_set("house_seen:1", json.dumps({"kind": "emergency", "reason": "екстрене відключення",
+                                                    "end": "", "ts": now}))
+        block = await status.house_block(await db.get_user(1))
+        self.assertIn("⏳ Без світла: сьогодні", block)
+        self.assertIn("за 7 днів", block)
+        await dtek_site.log_outage(1, False)  # світло дали — проміжок закрито
+        log_ = json.loads(await db.kv_get("house_log:1"))
+        self.assertIsNotNone(log_[-1][1])
+        await dtek_site.log_outage(1, True, "")  # знову вимкнули — новий проміжок
+        self.assertIsNone(json.loads(await db.kv_get("house_log:1"))[-1][1])

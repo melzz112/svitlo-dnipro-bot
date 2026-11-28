@@ -405,17 +405,23 @@ async def apply_users(probe_: Probe, users: list[dict]) -> list[tuple[int, str]]
                                  f"({was}). Я оновив групу в налаштуваннях."))
         prev = json.loads(await db.kv_get(f"house:{u['id']}") or "null")
         if off:
+            await log_outage(u["id"], True, h.start)
+            # порівнюємо з часом, який людина бачила в останньому пуші: дрібні зсуви по 20 хв не губляться
+            told, ext = (prev.get("told") or prev.get("end"), prev.get("ext", 0)) if prev else (None, 0)
             if not prev:
-                head = "У твоєму будинку зараз немає світла"
-            elif h.end and prev.get("end") and _shift_min(h.end, prev["end"]) >= SHIFT_MIN:
-                head = "Відключення у твоєму будинку продовжено"
-            elif h.end and prev.get("end") and _shift_min(h.end, prev["end"]) <= -SHIFT_MIN:
-                head = "Відключення у твоєму будинку скорочено"
+                head, told = "У твоєму будинку зараз немає світла", h.end
+            elif h.end and told and _shift_min(h.end, told) >= SHIFT_MIN:
+                ext += 1
+                head = "Відключення у твоєму будинку продовжено" + (f" (вже {ext}-й раз)" if ext >= 2 else "")
+                told = h.end
+            elif h.end and told and _shift_min(h.end, told) <= -SHIFT_MIN:
+                head, told = "Відключення у твоєму будинку скорочено", h.end
             else:
                 head = None
             if head and u.get("notify_on", 1):
                 out.append((u["id"], _house_off_text(street, num, h, head)))
-            await db.kv_set(f"house:{u['id']}", json.dumps({"start": h.start, "end": h.end, "miss": 0}))
+            await db.kv_set(f"house:{u['id']}", json.dumps(
+                {"start": h.start, "end": h.end, "told": told, "ext": ext, "miss": 0}))
             continue
         if not prev:
             continue
@@ -424,10 +430,39 @@ async def apply_users(probe_: Probe, users: list[dict]) -> list[tuple[int, str]]
             await db.kv_set(f"house:{u['id']}", json.dumps({**prev, "miss": miss}))
             continue
         await db.kv_set(f"house:{u['id']}", "")
+        await log_outage(u["id"], False)
         if u.get("notify_on", 1):
             out.append((u["id"], f"✅ <b>У твоєму будинку світло мало з'явитися</b>\n{street}, {num}\n"
                                  "<i>За даними сайту ДТЕК. Якщо світла ще немає — натисни «🙋 У мене є / нема світла».</i>"))
     return out
+
+
+# ---------- журнал відключень будинку: «скільки без світла сьогодні / за тиждень» ----------
+
+LOG_KEEP_SEC = 8 * 86400
+
+
+async def log_outage(uid: int, off: bool, start: str = ""):
+    """Сайт ДТЕК бачить будинок без світла — відкриваємо проміжок (з часу «з …» ДТЕК), світло є — закриваємо."""
+    import db
+
+    log_ = json.loads(await db.kv_get(f"house_log:{uid}") or "[]")
+    now = int(time.time())
+    is_open = bool(log_) and log_[-1][1] is None
+    if off and not is_open:
+        since = dt_ts(start) or now
+        last_end = log_[-1][1] if log_ else 0
+        log_.append([max(min(since, now), last_end or 0, now - 86400), None])
+    elif not off and is_open:
+        log_[-1][1] = now
+    else:
+        return
+    log_ = [x for x in log_ if (x[1] or now) > now - LOG_KEEP_SEC]
+    await db.kv_set(f"house_log:{uid}", json.dumps(log_))
+
+
+def outage_seconds(log_: list, since: float, now: float) -> int:
+    return int(sum(max(0, min(e or now, now) - max(s, since)) for s, e in log_))
 
 
 @dataclass
@@ -477,7 +512,7 @@ def short_dt(s: str) -> str:
 
 MIN_SHARE = 0.2  # екстрене в 1 будинку з 30 — не привід смикати всю групу; від 20% адрес групи — так
 END_MISSES = 2  # «світло є» за тими ж будинками — 2 перевірки поспіль, тоді «екстрене закінчилось»
-SHIFT_MIN = 30  # «продовжено до …» — лише якщо час зсунувся від 30 хв
+SHIFT_MIN = 60  # «продовжено до …» — лише якщо час зсунувся від години (ДТЕК зсуває по 7 разів на день)
 
 
 def _shift_min(new: str, old: str) -> int:

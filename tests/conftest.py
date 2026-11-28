@@ -27,6 +27,10 @@ def _isolated(tmp_path, monkeypatch):
     import notifier
     monkeypatch.setattr(dtek_site, "_poll_soon", False)
     monkeypatch.setattr(notifier, "_site_last", -1e9)
+    monkeypatch.setattr(notifier, "_rate", {})
+    monkeypatch.setattr(notifier, "_skipped", {})
+    import chat_streets
+    monkeypatch.setattr(chat_streets, "index", chat_streets.StreetIndex())
     asyncio.run(db.init())
     groups.reset()
     dtek_http.clear_backoff()

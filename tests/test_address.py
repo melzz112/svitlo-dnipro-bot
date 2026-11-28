@@ -205,8 +205,12 @@ class HouseWatchTests(DbCase):
         self.assertIn("до <b>18:05 20.11</b>", out[0][1])
         self.assertEqual(await self.run_probe(em("18:05 20.11.2026")), [])  # без змін — тиша
         self.assertEqual(await self.run_probe(em("18:20 20.11.2026")), [])  # +15 хв — не новина
-        out = await self.run_probe(em("19:00 20.11.2026"))
+        self.assertEqual(await self.run_probe(em("19:00 20.11.2026")), [])  # +55 хв від показаного — ще ні
+        out = await self.run_probe(em("19:10 20.11.2026"))  # дрібні зсуви склались у +65 хв — пуш
         self.assertIn("продовжено", out[0][1])
+        self.assertNotIn("раз)", out[0][1])
+        out = await self.run_probe(em("20:30 20.11.2026"))
+        self.assertIn("продовжено (вже 2-й раз)", out[0][1])
         self.assertEqual(await self.run_probe(None), [])  # перший раз «світло є» — ще чекаємо (сайт блимає)
         out = await self.run_probe(None)
         self.assertIn("світло мало з'явитися", out[0][1])

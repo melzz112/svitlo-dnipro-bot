@@ -405,6 +405,12 @@ async def notified_incidents(operator: str, grp: str, reason: str, exclude: int,
     )
 
 
+async def extensions_today(operator: str, grp: str, reason: str) -> int:
+    rows = await _all("SELECT COUNT(*) n FROM group_incidents WHERE operator=? AND group_name=? AND reason=? "
+                      "AND notified_group=1 AND updated_at>?", (operator, grp, reason, int(time.time()) - 18 * 3600))
+    return max(0, rows[0]["n"] - 1)
+
+
 async def active_incidents(operator: str, grp: str, now: int | None = None) -> list[dict]:
     return await _all(
         "SELECT * FROM group_incidents WHERE operator=? AND group_name=? AND status='active' AND end_time>? "
