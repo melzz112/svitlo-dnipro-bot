@@ -29,6 +29,7 @@ STREET_TYPES = {
     "тупик": "тупик", "туп": "тупик",  # ДТЕК пише повністю: «тупик Орільський»
     "проїзд": "проїзд", "проезд": "проїзд",
     "майдан": "майдан",
+    "ж/м": "ж/м", "жм": "ж/м", "масив": "ж/м", "житловий масив": "ж/м", "жилмассив": "ж/м",
 }
 _TYPE_RE = re.compile(r"(?<![\w'])(" + "|".join(sorted(map(re.escape, STREET_TYPES), key=len, reverse=True)) + r")\.?(?![\w'])")
 _LAT_TO_CYR = str.maketrans("ABCEHIKMOPTXaceiopxy", "АВСЕНІКМОРТХасеіорху")
@@ -105,6 +106,9 @@ def _buckets(query: str, streets: list[str]) -> tuple[list[str], list[str], list
     exact = [s for s in streets if street_core(s) == q_core or _core_tokens(s) == q_tokens]
     contains = [s for s in streets if s not in exact and set(q_tokens) <= set(_core_tokens(s))]
     seen = set(exact) | set(contains)
+    if not exact and not contains and len(q_tokens) > 1:
+        contains = [s for s in streets if (t := set(_core_tokens(s))) and t < set(q_tokens)
+                    and max(len(x) for x in t) >= 5]
     if exact or contains:  # є справжній збіг — схожі назви («Тилова» для «Титова») не беремо
         return exact, contains, []
     fuzzy = [s for s in streets if s not in seen

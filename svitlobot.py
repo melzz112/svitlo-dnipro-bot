@@ -317,18 +317,32 @@ _dir_streets: list[str] = []
 _dir_ts = 0.0
 
 
+_LAT = str.maketrans("iIaAoOeEcCpPxXyY", "іІаАоОеЕсСрРхХуУ")
+
+
 def split_address(address: str) -> tuple[str, str | None]:
-    """«Дніпро -> пр Слобожанський 19» -> («пр Слобожанський», «19»); «Магалевського 6 (п.1-3)» -> (…, «6»)."""
+    """«Дніпро -> пр Слобожанський 19» -> («пр Слобожанський», «19»); «Магалевського 6 (п.1-3)» -> (…, «6»).
+    Латинська «i» в кирилиці («Сiчових Стрiльцiв»), «пров.Джинчарадзе», ініціали «О. Поля» — теж."""
     from address import parse_text_address
 
-    return parse_text_address(address.split("->", 1)[-1].split("(", 1)[0])
+    addr = address.split("->", 1)[-1].split("(", 1)[0]
+    addr = re.sub(r"[A-Za-z]+", lambda m: m.group().translate(_LAT) if re.search(r"[а-яіїєґ]", addr, re.I) else m.group(), addr)
+    addr = re.sub(r"(?<=\w)\.(?=[А-ЯІЇЄҐа-яіїєґ])", ". ", addr)  # «пров.Джинчарадзе» -> «пров. Джинчарадзе»
+    addr = re.sub(r"(?<![\w])[А-ЯІЇЄҐ]\.\s*(?=[А-ЯІЇЄҐ][а-яіїєґ'’]{2,})", "", addr)  # «О. Поля» -> «Поля»
+    return parse_text_address(addr)
+
+
+def _base_house(house: str) -> str | None:
+    """«129Б», «81/2», «24-А» -> «129», «81», «24» — у довіднику буває лише основний номер."""
+    m = re.match(r"\d+", house or "")
+    return m.group() if m and m.group() != house else None
 
 
 async def directory_group(address: str) -> tuple[bool, str | None, str | None]:
     """(будинок є в довіднику?, постачальник, черга або None — будинок без черги)."""
     global _dir_ts, _dir_streets
     import db
-    from address import match_street
+    from address import norm_house, street_matches
 
     if time.time() - _dir_ts > DIR_TTL:
         _dir_cache.clear()
@@ -338,9 +352,15 @@ async def directory_group(address: str) -> tuple[bool, str | None, str | None]:
         return _dir_cache[address]
     res: tuple[bool, str | None, str | None] = (False, None, None)
     street, house = split_address(address)
-    if street and house and _dir_streets and (name := match_street(street, _dir_streets)):
-        if h := await db.find_house(name, house):
-            res = (True, h["operator"], h["group_name"])
+    if street and house and _dir_streets:
+        names = street_matches(street, _dir_streets, limit=5)
+        house = norm_house(house)
+        # спершу точний номер на будь-якій із вулиць, потім основний номер («129Б» -> «129»)
+        for num in filter(None, (house, _base_house(house))):
+            h = next(iter([x for n in names if (x := await db.find_house(n, num))]), None)
+            if h:
+                res = (True, h["operator"], h["group_name"])
+                break
     _dir_cache[address] = res
     return res
 
@@ -392,11 +412,16 @@ async def apply(points: list[Point], now: float | None = None) -> list[Change]:
         old = json.loads(await db.kv_get(_key(prov, grp)) or "null") or {}
         prev = old.get("state")
         new = decide(st, prev)
+        # 1–2 живі точки: стан чесно за ними (а не застряглий попередній), але з позначкою «мало датчиків» —
+        # для показу в «Зараз»; пушів групі й рішень про всю групу з таких даних не робимо
+        weak = 0 < st.alive < SVITLOBOT_MIN_SENSORS
+        if weak:
+            new = ON if st.on * 2 >= st.alive else OFF
         await db.kv_set(_key(prov, grp), json.dumps(
-            {"state": new, "on": st.on, "off": st.off, "maint": st.maint, "ts": now,
+            {"state": new, "on": st.on, "off": st.off, "maint": st.maint, "ts": now, "weak": weak,
              "since": old.get("since", now) if new == prev else now}
         ))
-        if _initialized and prev in (ON, OFF) and new in (ON, OFF) and new != prev:
+        if _initialized and not weak and not old.get("weak") and prev in (ON, OFF) and new in (ON, OFF) and new != prev:
             changes.append(Change(prov, grp, new, st))
     _initialized = True
     return changes
@@ -431,7 +456,8 @@ def status_line(s: dict | None) -> str | None:
     alive = s.get("on", 0) + s.get("off", 0)
     if not alive:
         return None
-    counts = f"({s['on']}/{alive} точок)"
+    counts = f"({s['on']}/{alive} {'точка' if alive == 1 else 'точки' if alive < 5 else 'точок'}"
+    counts += " — мало датчиків, лише орієнтир)" if s.get("weak") else ")"
     if s.get("state") == ON:
         what = f"🟢 є світло {counts}"
     elif s.get("state") == OFF:

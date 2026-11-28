@@ -973,3 +973,58 @@ class AddressSearchTests(DbCase):
         fails = await db.addr_fails()
         self.assertEqual((fails[-1]["q"], fails[-1]["house"], fails[-1]["why"]), ("Космическая", "99", "house"))
         self.assertIn("«Космическая 99» — будинку немає на вул. Космічна", await dr.report())
+
+
+class Group181ScenarioTests(DbCase):
+    """Скрин 28.11: графік 04:00–10:30, о 09:24 канал «світла ще немає» (без часу), зараз 11:51;
+    сайт: екстрене на 9 з 63 адрес до 12:30. Має бути «світло має бути» + рядок про частину адрес."""
+
+    async def test_stale_channel_post_and_partial_site(self):
+        G.register(NEW_QUEUES)
+        now = datetime.now(TZ).replace(hour=11, minute=51, second=0, microsecond=0)
+        posted = now.replace(hour=9, minute=24)
+        await db.add_alert("ch-181", "off", "18.1", None,
+                           "🚨 <b>Світла ще немає, відновлення очікується</b> · група <b>18.1</b>")
+        await db._exec("UPDATE alerts SET ts=? WHERE key='ch-181'", (int(posted.timestamp()),))
+        await db.kv_set("site_grp:18.1", json.dumps({"total": 63, "off": 9, "end": now.strftime("12:30 %d.%m.%Y"),
+                                                     "ts": int(now.timestamp()), "streets": ["вул. 20-річчя Перемоги"],
+                                                     "n_streets": 1}))
+        sch = {"today": {"18.1": [Slot(0, 1.5), Slot(4, 10.5), Slot(13, 19.5), Slot(22, 24)]}}
+        with patch.object(status, "get_schedule", AsyncMock(return_value=sch)), \
+                patch.object(status, "now_h", return_value=11 + 51 / 60), \
+                patch.object(status, "datetime", wraps=datetime) as dt:
+            dt.now.return_value = now
+            dt.fromtimestamp.side_effect = datetime.fromtimestamp
+            text = await status.verdict("18.1", "dtek")
+        self.assertIn("🟢 <b>Світло є</b>", text)
+        self.assertIn("відключення скінчилось о 10:30", text)  # пост о 09:24 був про слот 04:00–10:30
+        self.assertNotIn("Світла немає", text)
+        self.assertIn("🚧 Частина адрес групи без світла (сайт ДТЕК): екстрене у 9 з 63", text)
+        self.assertIn("до <b>12:30</b> · вул. 20-річчя Перемоги", text)
+        self.assertIn("далі <b>13:00–19:30</b>", text)
+
+
+class WeakSensorsTests(DbCase):
+    async def test_one_sensor_shows_honest_state_without_push(self):
+        import svitlobot as svb
+        G.register(NEW_QUEUES)
+        await db.kv_set("svb:dtek:18.1", json.dumps({"state": "off", "on": 0, "off": 1, "ts": 1, "since": 1}))
+        pt = svb.Point(id="1", status="on", changed=None, address="Дніпро -> x 1", slug="s1", subscribers=1,
+                       provider="dtek", grp="18.1")
+        with patch.object(svb, "_initialized", True):
+            changes = await svb.apply([pt])
+        self.assertEqual(changes, [])  # одна точка — групі не пушимо
+        st = await svb.group_state("dtek", "18.1")
+        self.assertEqual((st["state"], st["weak"]), ("on", True))  # не застрягло на «нема»
+        self.assertIn("🟢 є світло (1/1 точка — мало датчиків, лише орієнтир)", svb.status_line(st))
+        self.assertFalse(await status.sensors_say_on("18.1", "dtek"))  # для рішень про групу — ні
+
+
+class HouseScheduleUntilTests(DbCase):
+    async def test_schedule_outage_shows_end_time(self):
+        await db.set_user(1, grp="14.1", provider="dtek", street="вул. Микитинська", house="14")
+        today = datetime.now(TZ).strftime("%d.%m.%Y")
+        await db.kv_set("house_seen:1", json.dumps({"kind": "schedule", "reason": "відключення за графіком",
+                                                    "start": f"08:40 {today}", "end": f"13:30 {today}",
+                                                    "ts": int(time.time())}))
+        self.assertIn("🔴 відключення за графіком до <b>13:30</b>", await status.house_block(await db.get_user(1)))

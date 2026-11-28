@@ -35,17 +35,34 @@ def _until_dt(until: str, ts: int) -> datetime | None:
     return dt
 
 
-def _is_active(a: dict, now: datetime) -> bool:
+def _slot_end_at(a: dict, slots) -> datetime | None:
+    """Пост написали під час відключення за графіком — кінець цього слоту (тоді й пост уже не про «зараз»)."""
+    at = datetime.fromtimestamp(a["ts"], TZ)
+    h = at.hour + at.minute / 60
+    midnight = at.replace(hour=0, minute=0, second=0, microsecond=0)
+    for s in slots or []:
+        if s.kind == "off" and s.start <= h < s.end:
+            return midnight + timedelta(hours=s.end)
+    return None
+
+
+def _is_active(a: dict, now: datetime, slots=None) -> bool:
     end = _until_dt(a["until"], a["ts"])
-    if end is None:  # без часу — вважаємо актуальним 3 год
+    if end is None:
+        # «Світла ще немає, відновлення очікується» без часу: 3 год — або до кінця слоту графіка, під час
+        # якого це написали (о 9:24 при відключенні 04:00–10:30 — до 10:30, а не до 12:24)
+        slot_end = _slot_end_at(a, slots)
+        if slot_end is not None:
+            return now < slot_end
         return now.timestamp() - a["ts"] < 3 * 3600
     return end > now
 
 
-async def _outage_chain(grp, provider, now):
+async def _outage_chain(grp, provider, now, sch: dict | None = None):
     """Активні аварійні алерти групи: (останній — для причини, час першого — початок відключення).
     Сайт ДТЕК сказав «екстрене закінчилось» — усе, що було до того, вже не діє."""
-    active = [a for a in await db.off_alerts(grp, provider) if _is_active(a, now)]
+    slots = (sch or {}).get("today", {}).get(grp)
+    active = [a for a in await db.off_alerts(grp, provider) if _is_active(a, now, slots)]
     if ended := await db.last_alert("on", grp, 12 * 60, provider, src="dteksite"):
         active = [a for a in active if a["ts"] > ended["ts"]]
     if not active:
@@ -124,7 +141,8 @@ async def official_outage(grp: str, provider: str, sch: dict | None = None, now:
     slot = None if city_em else next(
         (s for s in sch.get("today", {}).get(grp, []) if s.kind == "off" and s.start <= t < s.end), None
     )
-    alert, alert_start = await _outage_chain(grp, provider, now)
+    # під час екстрених у місті графік не діє — пост каналу не прив'язуємо до слоту
+    alert, alert_start = await _outage_chain(grp, provider, now, None if city_em else sch)
     starts = []
     if alert_start:
         starts.append(alert_start)
@@ -142,7 +160,8 @@ async def official_outage(grp: str, provider: str, sch: dict | None = None, now:
 
 async def sensors_say_on(grp: str, provider: str) -> bool:
     """Свіжий стан датчиків Світлобота групи — «є світло» (у більшості точок)."""
-    return (await svitlobot.group_state(provider, grp) or {}).get("state") == svitlobot.ON
+    s = await svitlobot.group_state(provider, grp) or {}
+    return s.get("state") == svitlobot.ON and not s.get("weak")  # 1–2 датчики — лише для показу
 
 
 PARTIAL_SHARE = 2 / 3  # без світла менше 2/3 перевірених адрес групи — «частина групи», а не вся група
@@ -274,7 +293,9 @@ async def verdict(grp: str, provider: str) -> str:
         lines.append(line)
     if note:
         lines.append(note)
-    if share := await _group_share(grp, now, "🚨 Офіційно (сайт ДТЕК)") if provider == "dtek" else None:
+    site_part = await partial_outage(grp, provider, None, None, now)
+    prefix = "🚧 Частина адрес групи без світла (сайт ДТЕК)" if site_part else "🚨 Офіційно (сайт ДТЕК)"
+    if share := await _group_share(grp, now, prefix) if provider == "dtek" else None:
         lines.append(share)  # екстрене хоч на кількох адресах групи — пуш усім не шлемо, але показуємо завжди
         if alert and alert.get("src") != "dteksite":
             ch_till = f" до {channel_until}" if channel_until else ""
@@ -358,8 +379,10 @@ async def house_block(user: dict) -> str | None:
         end = re.match(r"(\d{1,2}:\d{2})(?:\s+(\d{2}\.\d{2}))?", seen.get("end") or "")
         until = f" до <b>{_short_until(' '.join(x for x in end.groups() if x), now)}</b>" if end else ""
         return f"🏠 <b>Твій будинок</b> ({addr})\n🔴 {seen.get('reason') or 'відключення'}{until} · {checked}{hours}"
-    if seen.get("kind") == "schedule":
-        return f"🏠 <b>Твій будинок</b> ({addr})\n🔴 відключення за графіком · {checked}{hours}"
+    if seen.get("kind") == "schedule":  # ДТЕК перейшов на індивідуальні графіки — час саме для будинку
+        end = re.match(r"(\d{1,2}:\d{2})(?:\s+(\d{2}\.\d{2}))?", seen.get("end") or "")
+        until = f" до <b>{_short_until(' '.join(x for x in end.groups() if x), now)}</b>" if end else ""
+        return f"🏠 <b>Твій будинок</b> ({addr})\n🔴 відключення за графіком{until} · {checked}{hours}"
     # лише про сам будинок: що діється по групі (екстрене на інших адресах, аварії) — один раз, у «По групі»
     return f"🏠 <b>Твій будинок</b> ({addr})\n✅ відключень немає · {checked}{hours}"
 

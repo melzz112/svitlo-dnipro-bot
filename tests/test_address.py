@@ -258,7 +258,8 @@ class HouseWatchTests(DbCase):
         self.assertIsNone(await db.last_alert("off", "1.2", 60, "dtek"))  # групі пуша немає
         with patch.object(status, "get_schedule", AsyncMock(return_value={"today": {"1.2": []}})):
             text = await status.verdict("1.2", "dtek")
-        self.assertIn("🚨 Офіційно (сайт ДТЕК): екстрене у 3 з 20 перевірених адрес групи, до <b>18:05", text)
+        self.assertIn("🚧 Частина адрес групи без світла (сайт ДТЕК): екстрене у 3 з 20 перевірених адрес групи, до <b>18:05", text)
+        self.assertIn("🟢 <b>Світло має бути</b>", text)  # 3 з 20 — не вся група
         self.assertIn("· вул. Х", text)
         self.assertNotIn("та ін.", text)
         # у мого будинку чисто, а по групі є екстрене — блок будинку лише про будинок, група — один раз нижче
@@ -270,7 +271,7 @@ class HouseWatchTests(DbCase):
         await db.add_alert("ch1", "off", "1.2", "13:30", "🚨 <b>Аварійне відключення</b>", "dtek", "channel")
         with patch.object(status, "get_schedule", AsyncMock(return_value={"today": {"1.2": []}})):
             text = await status.verdict("1.2", "dtek")
-        self.assertIn("🚨 Офіційно (сайт ДТЕК): екстрене у 3 з 20", text)  # головне — сайт
+        self.assertIn("(сайт ДТЕК): екстрене у 3 з 20", text)  # головне — сайт
         self.assertIn("📢 Канали: аварійне відключення до 13:30", text)  # канали — другим рядком
         self.assertIn("до <b>18:05", text)
 
