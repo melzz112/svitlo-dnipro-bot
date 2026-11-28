@@ -30,6 +30,8 @@ class FakeNodriver(types.ModuleType):
             browser=types.SimpleNamespace(get_version=lambda: ("get_version",)),
             network=types.SimpleNamespace(set_user_agent_override=lambda **kw: ("override", kw)))
         self.ua = HEADLESS_UA
+        self.registry = set()  # як nodriver.util.__registered__instances__
+        self.util = types.SimpleNamespace(get_registered_instances=lambda: self.registry)
         self.fail_get = fail_get
         self.starts = self.active = self.max_active = self.stops = 0
         self.profiles: list[str] = []
@@ -45,7 +47,9 @@ class FakeNodriver(types.ModuleType):
         self.kwargs.append(kw)
         self.profiles.append(kw["user_data_dir"])
         await asyncio.sleep(0.05)  # браузер стартує не миттєво — інші виклики встигають прийти
-        return _Browser(self)
+        b = _Browser(self)
+        self.registry.add(b)  # nodriver реєструє кожен браузер і після stop() сам не прибирає
+        return b
 
 
 class _Tab:
@@ -120,6 +124,7 @@ class LockTests(BrowserCase):
             self.assertIn(arg, kw["browser_args"])
         self.assertEqual(nd.stops, 1)
         self.assertFalse(os.path.exists(nd.profiles[0]))  # тимчасовий профіль прибрано
+        self.assertEqual(nd.registry, set())  # без цього кожен запуск лишав ~10 МБ у пам'яті
 
     async def test_cooldown_between_launches(self):
         nd = self.use(FakeNodriver())
@@ -140,6 +145,7 @@ class CleanupTests(BrowserCase):
         self.assertEqual((nd.starts, nd.stops, nd.active), (1, 1, 0))
         self.assertFalse(os.path.exists(nd.profiles[0]))
         self.assertIsNone(dtek_http.browser_session())
+        self.assertEqual(nd.registry, set())  # і при помилці теж
 
     async def test_browser_stopped_when_no_cookies(self):
         nd = self.use(FakeNodriver(cookies=[]))

@@ -224,7 +224,25 @@ async def _launch_browser() -> BrowserSession:
                     await res
             except Exception as e:  # pragma: no cover
                 log.warning("ДТЕК: браузер не закрився чисто: %r", e)
+            _forget_browser(uc, browser)
         shutil.rmtree(profile, ignore_errors=True)
+
+
+def _forget_browser(uc, browser):
+    """nodriver кладе кожен браузер у глобальний util.__registered__instances__ і після stop() не прибирає:
+    з ним у пам'яті лишаються вкладки, з'єднання й розібрана сторінка — ~10 МБ на запуск (за добу — сотні МБ)."""
+    try:
+        registry = uc.util.get_registered_instances()
+    except AttributeError:
+        try:
+            from nodriver.core import util as nd_util
+            registry = nd_util.get_registered_instances()
+        except Exception:
+            return
+    try:
+        registry.discard(browser)
+    except Exception:  # pragma: no cover
+        pass
 
 
 async def _plain_user_agent(tab):
