@@ -53,11 +53,11 @@ class DuringOutageTests(VerdictCase):
         await self.say("on", 1, "on1")
         text = await self.verdict(self.slot())
         self.assertIn("🔴 <b>Світла немає</b>", text)
-        self.assertIn("є — 1  ·  🕯 нема — 4", text)
+        self.assertIn("💡 1 · 🕯 4", text)
         await self.say("on", 2, "on2")  # 16:42: ще двоє «дали» — разом 3
         text = await self.verdict(self.slot())
         self.assertNotIn("🟢", text)  # раніше тут було «Світло є»
-        self.assertIn("🕯 нема — 4", text)  # ранні «нема» не викидаємо
+        self.assertIn("🕯 4", text)  # ранні «нема» не викидаємо
         self.assertIn("🔴 <b>Світла немає</b>", text)
 
     async def test_few_on_is_still_no_power(self):
@@ -82,7 +82,7 @@ class DuringOutageTests(VerdictCase):
         await self.say("on", 12, "on", ago_min=7)
         text = await self.verdict(slot)
         self.assertIn("🟡 <b>Частково є світло</b>", text)
-        self.assertIn("(за 30 хв: 💡 12 · 🕯 4)", text)
+        self.assertIn("(30 хв: 💡 12 · 🕯 4)", text)
         self.assertNotIn("🟢", text)
 
 
@@ -109,7 +109,7 @@ class FastSwitchTests(VerdictCase):
         await self.say("on", 2, "on", ago_min=1)
         text = await self.verdict([])
         self.assertIn("🔴 <b>Світла немає</b>", text)
-        self.assertIn("нема — 5", text)
+        self.assertIn("🕯 5", text)
 
 
 class AfterOutageTests(VerdictCase):
@@ -130,7 +130,7 @@ class AfterOutageTests(VerdictCase):
         await self.say("off", 1, "off", ago_min=5)  # після кінця
         text = await self.verdict(self.slot())
         self.assertIn("🟢 <b>Світло є</b>", text)
-        self.assertIn("⚠️ Не всі зі світлом — 1 пише, що досі нема", text)
+        self.assertIn("🕯 1", text)
 
     async def test_many_still_without_power_is_local_outage(self):
         await self.say("off", 3, "off", ago_min=5)

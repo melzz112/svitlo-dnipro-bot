@@ -243,15 +243,15 @@ async def now(cb: CallbackQuery):
     u = await db.get_user(cb.from_user.id)
     if _no_queue(u):  # будинок без черги: лише те, що сайт ДТЕК каже про сам будинок
         clock = datetime.now(TZ).strftime("%H:%M")
-        text = f"⚡ <b>{_pname(u)} · будинок без черги</b>  ·  {clock}\n\n{await house_block(u)}"
+        text = f"⚡ <b>{_pname(u)} · будинок без черги</b> · {clock}\n\n{await house_block(u)}"
         await edit(cb, text, kb.now_kb())
         return
     if not (u := await _need_group(cb)):
         return
     clock = datetime.now(TZ).strftime("%H:%M")
-    text = f"⚡ <b>{_pname(u)} · група {u['grp']}</b>  ·  {clock}\n\n"
+    text = f"⚡ <b>{_pname(u)} · група {u['grp']}</b> · {clock}\n\n"
     if house := await house_block(u):  # найточніше — що сайт ДТЕК каже саме про твій будинок
-        text += f"{house}\n\n<b>По групі:</b>\n"
+        text += f"{house}\n\n<b>Група {u['grp']}</b>\n"
     text += await verdict(u["grp"], _prov(u))
     await edit(cb, text, kb.now_kb())
 

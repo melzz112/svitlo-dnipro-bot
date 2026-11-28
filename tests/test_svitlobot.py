@@ -125,8 +125,8 @@ class ApplyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cek_separate(self):
         await svb.apply(self.pts(10, 0) + self.pts(0, 10, "Дніпро (ЦЕК) — група 1.2"))
-        self.assertEqual(svb.status_line(await svb.group_state("dtek", "1.2")), "📡 Датчики Світлобота: 🟢 є світло (10/10 точок)")
-        self.assertEqual(svb.status_line(await svb.group_state("cek", "1.2")), "📡 Датчики Світлобота: 🔴 світла немає (0/10 точок)")
+        self.assertEqual(svb.status_line(await svb.group_state("dtek", "1.2")), "📡 Датчики: 🟢 10 з 10 зі світлом")
+        self.assertEqual(svb.status_line(await svb.group_state("cek", "1.2")), "📡 Датчики: 🔴 0 з 10 зі світлом")
 
     async def test_notifier_push_and_failure(self):
         await db.set_user(1, grp="1.2", provider="dtek")
@@ -149,7 +149,7 @@ class ApplyTests(unittest.IsolatedAsyncioTestCase):
         await svb.apply(self.pts(14, 2))
         with patch.object(status, "get_schedule", AsyncMock(return_value={"today": {"1.2": []}})):
             text = await status.verdict("1.2", "dtek")
-        self.assertIn("📡 Датчики Світлобота: 🟢 є світло (14/16 точок)", text)
+        self.assertIn("📡 Датчики: 🟢 14 з 16 зі світлом", text)
 
 
 class FetchTests(unittest.IsolatedAsyncioTestCase):

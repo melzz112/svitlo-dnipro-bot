@@ -164,6 +164,13 @@ async def sensors_say_on(grp: str, provider: str) -> bool:
     return s.get("state") == svitlobot.ON and not s.get("weak")  # 1–2 датчики — лише для показу
 
 
+async def sensors_strong_on(grp: str, provider: str) -> bool:
+    """Багато датчиків (≥ 5) і майже всі (≥ 80%) зі світлом — цьому віримо більше, ніж груповому графіку."""
+    s = await svitlobot.group_state(provider, grp) or {}
+    alive = s.get("on", 0) + s.get("off", 0)
+    return not s.get("weak") and alive >= 5 and s.get("on", 0) >= 0.8 * alive
+
+
 PARTIAL_SHARE = 2 / 3  # без світла менше 2/3 перевірених адрес групи — «частина групи», а не вся група
 
 
@@ -222,7 +229,11 @@ async def verdict(grp: str, provider: str) -> str:
         # хвилю «дали» зараз
         r_on, r_off = _recent_votes(people, now)
         till = f" до <b>{until}</b>" if until else ""
-        if await partial_outage(grp, provider, alert, slot, now):
+        if slot and not alert and await sensors_strong_on(grp, provider):
+            # за графіком групи — відключення, а датчики в будинках групи масово бачать світло: ДТЕК тепер має
+            # індивідуальні графіки за адресами, груповий може не збігатися з реальністю
+            head, sub = "🟢 <b>Світло є</b>", "датчики бачать світло — графік групи зараз не діє"
+        elif await partial_outage(grp, provider, alert, slot, now):
             # сайт ДТЕК: екстрене лише на частині адрес групи (222 з 575) — це не «у групи світла немає»
             if sensors_on or n_on > n_off or r_on > r_off:
                 head = "🟢 <b>Світло є, але не в усіх</b>"
@@ -284,34 +295,29 @@ async def verdict(grp: str, provider: str) -> str:
         note = None
 
     lines = [head, f"<i>{sub}</i>", ""]
-    # 3) факти: люди / офіційно / графік
-    if n_on or n_off:
-        # один рядок: з якого часу рахуємо + скільки з них за 30 хв (від кожної людини — останнє)
-        line = f"👥 Люди з {_hm_ts(since_ts)}:  💡 є — {n_on}  ·  🕯 нема — {n_off}"
-        if (r_on, r_off) != (n_on, n_off) and (r_on or r_off):
-            line += f"  <i>(за 30 хв: 💡 {r_on} · 🕯 {r_off})</i>"
-        lines.append(line)
-    if note:
-        lines.append(note)
+    # 3) факти — по рядку на джерело, коротко: датчики, сайт ДТЕК / канали, люди, графік
+    if sensors := svitlobot.status_line(await svitlobot.group_state(provider, grp)):
+        lines.append(sensors)  # фактичний стан за датчиками в будинках групи
     site_part = await partial_outage(grp, provider, None, None, now)
-    prefix = "🚧 Частина адрес групи без світла (сайт ДТЕК)" if site_part else "🚨 Офіційно (сайт ДТЕК)"
-    if share := await _group_share(grp, now, prefix) if provider == "dtek" else None:
+    if share := await _group_share(grp, now, "🚧 Аварія" if site_part else "🚨 Сайт ДТЕК") if provider == "dtek" else None:
         lines.append(share)  # екстрене хоч на кількох адресах групи — пуш усім не шлемо, але показуємо завжди
         if alert and alert.get("src") != "dteksite":
             ch_till = f" до {channel_until}" if channel_until else ""
             lines.append(f"📢 Канали: {_label(alert['text'])}{ch_till}")
     elif alert:
-        src = "сайт ДТЕК" if alert.get("src") == "dteksite" else "канали"
-        lines.append(f"🚨 Офіційно ({src}): {_label(alert['text'])}{till}")
-        if alert.get("src") == "dteksite" and (m := re.search(r"🏠 ([^\n]*)", alert["text"])):
-            lines.append(f"🏠 {m.group(1)} (сайт ДТЕК)")
-    if not share and not alert:  # те саме відключення вже описане рядком «Офіційно» — не дублюємо
+        src = "🚨 Сайт ДТЕК" if alert.get("src") == "dteksite" else "📢 Канали"
+        lines.append(f"{src}: {_label(alert['text'])}{till}")
+    if not share and not alert:  # те саме відключення вже описане рядком вище — не дублюємо
         for inc in (await db.active_incidents(provider, grp, int(now.timestamp())))[:2]:
             lines.append(incident_line(inc, now))  # аварія з часом ремонту на адресах групи (сайт ДТЕК / канали)
-    if sensors := svitlobot.status_line(await svitlobot.group_state(provider, grp)):
-        lines.append(sensors)  # фактичний стан за датчиками в будинках групи
+    if n_on or n_off:
+        # з якого часу рахуємо (від кожної людини — останнє) + свіжі за 30 хв
+        line = f"👥 Люди з {_hm_ts(since_ts)}: 💡 {n_on} · 🕯 {n_off}"
+        if (r_on, r_off) != (n_on, n_off) and (r_on or r_off):
+            line += f"  <i>(30 хв: 💡 {r_on} · 🕯 {r_off})</i>"
+        lines.append(line)
     if city_em and "кстрені" not in head + sub:  # у заголовку вже сказано про екстрені — не повторюємо
-        lines.append("🚨 У Дніпрі діють екстрені відключення — графік зараз не діє")
+        lines.append("🚨 У Дніпрі екстрені — графік не діє")
     if not city_em and not is_emergency_alert(alert) and (sched_line := _schedule_line(today_slots, slot, t)):
         lines.append(sched_line)
     return "\n".join(lines).rstrip()
@@ -343,10 +349,10 @@ async def _group_share(grp: str, now: datetime, prefix: str = "🏠 Сайт Д�
     s = await _site_group(grp, now)
     if not s or not s.get("off"):
         return None
-    until = f", до <b>{u}</b>" if (u := _site_until(s, now)) else ""
+    until = f" до <b>{u}</b>" if (u := _site_until(s, now)) else ""
     streets = s.get("streets") or []
     where = (f" · {escape(', '.join(streets))}" + (" та ін." if s.get("n_streets", 0) > len(streets) else "")) if streets else ""
-    return f"{prefix}: екстрене у {s['off']} з {s['total']} перевірених адрес групи{until}{where}"
+    return f"{prefix}: {s['off']} з {s['total']} адрес{until}{where}"
 
 
 async def house_block(user: dict) -> str | None:
@@ -359,7 +365,7 @@ async def house_block(user: dict) -> str | None:
     if not seen or now.timestamp() - seen.get("ts", 0) > FRESH_SEC:
         probe = await _site_probe()
         if probe and not probe.get("ok"):  # остання перевірка справді впала
-            return f"🏠 <b>Твій будинок</b> ({addr}): сайт ДТЕК зараз не відповідає — дивись нижче за групою"
+            return f"🏠 <b>{addr}</b>\n⚠️ Сайт ДТЕК зараз не відповідає — дивись нижче за групою"
         planned = int(await db.kv_get("site_next_ts") or 0)
         if not planned and probe and DTEK_POLL_INTERVAL_SEC:
             planned = probe["ts"] + DTEK_POLL_INTERVAL_SEC
@@ -370,21 +376,20 @@ async def house_block(user: dict) -> str | None:
             when = f"наступна перевірка ≈ {datetime.fromtimestamp(planned, TZ):%H:%M}"
         else:
             when = "перевірю найближчим часом"
-        return (f"🏠 <b>Твій будинок</b> ({addr}): ще не перевіряв на сайті ДТЕК — {when}. "
-                "Поки дивись нижче за групою")
+        return f"🏠 <b>{addr}</b>\n⏳ Ще не перевіряв на сайті ДТЕК — {when}"
     ago = int(now.timestamp() - seen["ts"]) // 60
-    checked = f"<i>сайт ДТЕК, {ago} хв тому</i>" if ago else "<i>сайт ДТЕК, щойно</i>"
+    checked = f"\n<i>сайт ДТЕК · {f'{ago} хв тому' if ago else 'щойно'}</i>"
     hours = await _outage_hours(user["id"], now)
-    if seen.get("kind") and seen["kind"] != "schedule":
-        end = re.match(r"(\d{1,2}:\d{2})(?:\s+(\d{2}\.\d{2}))?", seen.get("end") or "")
-        until = f" до <b>{_short_until(' '.join(x for x in end.groups() if x), now)}</b>" if end else ""
-        return f"🏠 <b>Твій будинок</b> ({addr})\n🔴 {seen.get('reason') or 'відключення'}{until} · {checked}{hours}"
+    end = re.match(r"(\d{1,2}:\d{2})(?:\s+(\d{2}\.\d{2}))?", seen.get("end") or "")
+    until = f" до <b>{_short_until(' '.join(x for x in end.groups() if x), now)}</b>" if end else ""
     if seen.get("kind") == "schedule":  # ДТЕК перейшов на індивідуальні графіки — час саме для будинку
-        end = re.match(r"(\d{1,2}:\d{2})(?:\s+(\d{2}\.\d{2}))?", seen.get("end") or "")
-        until = f" до <b>{_short_until(' '.join(x for x in end.groups() if x), now)}</b>" if end else ""
-        return f"🏠 <b>Твій будинок</b> ({addr})\n🔴 відключення за графіком{until} · {checked}{hours}"
-    # лише про сам будинок: що діється по групі (екстрене на інших адресах, аварії) — один раз, у «По групі»
-    return f"🏠 <b>Твій будинок</b> ({addr})\n✅ відключень немає · {checked}{hours}"
+        state = f"🔴 За графіком{until}"
+    elif seen.get("kind"):
+        reason = seen.get("reason") or "відключення"
+        state = f"🔴 {reason[:1].upper()}{reason[1:]}{until}"
+    else:  # лише про сам будинок: що діється по групі — один раз, нижче
+        state = "✅ Відключень немає"
+    return f"🏠 <b>{addr}</b>\n{state}{hours}{checked}"
 
 
 def _dur(sec: int) -> str:
@@ -404,7 +409,7 @@ async def _outage_hours(uid: int, now: datetime) -> str:
     today, week = outage_seconds(log_, midnight, ts), outage_seconds(log_, ts - 7 * 86400, ts)
     if not week:
         return ""
-    return f"\n⏳ Без світла: сьогодні {_dur(today) if today else '—'} · за 7 днів {_dur(week)}"
+    return f"\n⏳ Без світла сьогодні {_dur(today) if today else '—'} · за тиждень {_dur(week)}"
 
 
 def incident_until(inc: dict, now: datetime) -> str:
@@ -412,9 +417,9 @@ def incident_until(inc: dict, now: datetime) -> str:
 
 
 def incident_line(inc: dict, now: datetime) -> str:
-    """«🚧 Аварія по групі 14.1: аварійні ремонтні роботи · вул. Березинська, до 18:00»."""
+    """«🚧 Аварія: аварійні ремонтні роботи до 18:00 · вул. Березинська»."""
     where = f" · {escape(inc['street_name'])}" if inc.get("street_name") else ""
-    return f"🚧 Аварія по групі {inc['group_name']}: {escape(inc['reason'])}{where}, до <b>{incident_until(inc, now)}</b>"
+    return f"🚧 Аварія: {escape(inc['reason'])} до <b>{incident_until(inc, now)}</b>{where}"
 
 
 def _short_until(until: str, now: datetime) -> str:
@@ -434,7 +439,7 @@ def _schedule_line(slots, current, t: float) -> str | None:
         return f"📅 Графік: відключення до <b>{hm(current.end)}</b>"
     nxt = min((s for s in slots if s.kind == "off" and s.start > t), key=lambda s: s.start, default=None)
     if not nxt:
-        return "📅 Графік: сьогодні більше відключень немає"
+        return "📅 Графік: сьогодні більше без відключень"
     left = nxt.start - t
     wait = f"{int(left)} год {round(left % 1 * 60)} хв" if left >= 1 else f"{round(left * 60)} хв"
     return f"📅 Графік: далі <b>{hm(nxt.start)}–{hm(nxt.end)}</b> (через {wait})"

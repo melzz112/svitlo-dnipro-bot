@@ -234,18 +234,18 @@ class HouseWatchTests(DbCase):
     async def test_now_screen_house_block(self):
         await self.run_probe(house(EMERGENCY, "13:16 20.11.2026", "18:05 20.11.2026"))
         block = await status.house_block(await db.get_user(1))
-        self.assertIn("Твій будинок", block)
-        self.assertIn("🔴 екстрене відключення до <b>18:05", block)
+        self.assertIn("🏠 <b>", block)
+        self.assertIn("🔴 Екстрене відключення до <b>18:05", block)
         self.assertIn("сайт ДТЕК", block)
         await db.kv_set("house_seen:1", json.dumps({"kind": None, "ts": int(time.time())}))
-        self.assertIn("✅ відключень немає", await status.house_block(await db.get_user(1)))
+        self.assertIn("✅ Відключень немає", await status.house_block(await db.get_user(1)))
         # опитування раз на 10 хв: дані 15-хвилинної давності — ще свіжі (інтервал + 10 хв запасу)
         await db.kv_set("house_seen:1", json.dumps({"kind": None, "ts": int(time.time()) - 15 * 60}))
-        self.assertIn("✅ відключень немає", await status.house_block(await db.get_user(1)))
+        self.assertIn("✅ Відключень немає", await status.house_block(await db.get_user(1)))
         await db.kv_set("house_seen:1", json.dumps({"kind": None, "ts": int(time.time()) - 3600}))
         await db.kv_set("site_probe", json.dumps({"ok": True, "ts": int(time.time()) - 10 * 60}))
         block = await status.house_block(await db.get_user(1))
-        self.assertIn("ще не перевіряв", block)  # сайт працює — просто ще не дійшла черга
+        self.assertIn("Ще не перевіряв", block)  # сайт працює — просто ще не дійшла черга
         self.assertNotIn("не відповідає", block)
         await db.kv_set("site_probe", json.dumps({"ok": False, "ts": int(time.time())}))
         self.assertIn("не відповідає", await status.house_block(await db.get_user(1)))
@@ -258,20 +258,20 @@ class HouseWatchTests(DbCase):
         self.assertIsNone(await db.last_alert("off", "1.2", 60, "dtek"))  # групі пуша немає
         with patch.object(status, "get_schedule", AsyncMock(return_value={"today": {"1.2": []}})):
             text = await status.verdict("1.2", "dtek")
-        self.assertIn("🚧 Частина адрес групи без світла (сайт ДТЕК): екстрене у 3 з 20 перевірених адрес групи, до <b>18:05", text)
+        self.assertIn("🚧 Аварія: 3 з 20 адрес до <b>18:05", text)
         self.assertIn("🟢 <b>Світло має бути</b>", text)  # 3 з 20 — не вся група
         self.assertIn("· вул. Х", text)
         self.assertNotIn("та ін.", text)
         # у мого будинку чисто, а по групі є екстрене — блок будинку лише про будинок, група — один раз нижче
         await db.kv_set("house_seen:1", json.dumps({"kind": None, "ts": int(time.time())}))
         block = await status.house_block(await db.get_user(1))
-        self.assertIn("✅ відключень немає", block)
+        self.assertIn("✅ Відключень немає", block)
         self.assertNotIn("3 з 20", block)
         # канал теж пише про відключення — рядок сайту не ховаємо
         await db.add_alert("ch1", "off", "1.2", "13:30", "🚨 <b>Аварійне відключення</b>", "dtek", "channel")
         with patch.object(status, "get_schedule", AsyncMock(return_value={"today": {"1.2": []}})):
             text = await status.verdict("1.2", "dtek")
-        self.assertIn("(сайт ДТЕК): екстрене у 3 з 20", text)  # головне — сайт
+        self.assertIn("3 з 20 адрес", text)  # головне — сайт
         self.assertIn("📢 Канали: аварійне відключення до 13:30", text)  # канали — другим рядком
         self.assertIn("до <b>18:05", text)
 

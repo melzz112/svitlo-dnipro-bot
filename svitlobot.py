@@ -456,15 +456,9 @@ def status_line(s: dict | None) -> str | None:
     alive = s.get("on", 0) + s.get("off", 0)
     if not alive:
         return None
-    counts = f"({s['on']}/{alive} {'точка' if alive == 1 else 'точки' if alive < 5 else 'точок'}"
-    counts += " — мало датчиків, лише орієнтир)" if s.get("weak") else ")"
-    if s.get("state") == ON:
-        what = f"🟢 є світло {counts}"
-    elif s.get("state") == OFF:
-        what = f"🔴 світла немає {counts}"
-    else:
-        what = f"🟡 неоднозначно {counts}"
-    return f"📡 Датчики Світлобота: {what}"
+    icon = {ON: "🟢", OFF: "🔴"}.get(s.get("state"), "🟡")
+    weak = " · мало точок" if s.get("weak") else ""
+    return f"📡 Датчики: {icon} {s['on']} з {alive} зі світлом{weak}"
 
 
 if __name__ == "__main__":  # python svitlobot.py — що зараз бачать датчики по групах

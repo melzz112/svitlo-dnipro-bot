@@ -280,7 +280,7 @@ class IncidentTests(DbCase):
         self.assertEqual(self.sent(), [])  # без дублів
 
         now = await _verdict("14.1")
-        self.assertIn("🚧 Аварія по групі 14.1: аварійні ремонтні роботи", now)
+        self.assertIn("🚧 Аварія: аварійні ремонтні роботи", now)
 
     async def test_channel_and_site_same_incident_once(self):
         end = datetime.now(TZ).replace(second=0, microsecond=0) + timedelta(hours=3)
@@ -598,7 +598,7 @@ class PartialOutageWordingTests(DbCase):
         self.assertIn("екстрене лише на частині адрес групи", text)
         self.assertNotIn("Світла немає", text)
         self.assertNotIn("офіційно — відключення до", text)
-        self.assertIn("екстрене у 222 з 575 перевірених адрес групи, до", text)  # час — при адресах
+        self.assertIn("🚧 Аварія: 222 з 575 адрес до", text)  # час — при адресах
 
     async def test_time_kept_when_whole_group_is_off(self):
         G.register(NEW_QUEUES)
@@ -789,7 +789,7 @@ class QuietDigestTests(DbCase):
         uid, text = bot.send_message.await_args.args
         self.assertEqual(uid, 1)
         self.assertIn("Доброго ранку", text)
-        self.assertIn("Твій будинок", text)
+        self.assertIn("🏠 <b>", text)
         self.assertIn("10:00", text)
 
     def test_settings_buttons(self):
@@ -924,8 +924,8 @@ class OutageHoursTests(DbCase):
         await db.kv_set("house_seen:1", json.dumps({"kind": "emergency", "reason": "екстрене відключення",
                                                     "end": "", "ts": now}))
         block = await status.house_block(await db.get_user(1))
-        self.assertIn("⏳ Без світла: сьогодні", block)
-        self.assertIn("за 7 днів", block)
+        self.assertIn("⏳ Без світла сьогодні", block)
+        self.assertIn("за тиждень", block)
         await dtek_site.log_outage(1, False)  # світло дали — проміжок закрито
         log_ = json.loads(await db.kv_get("house_log:1"))
         self.assertIsNotNone(log_[-1][1])
@@ -999,7 +999,7 @@ class Group181ScenarioTests(DbCase):
         self.assertIn("🟢 <b>Світло є</b>", text)
         self.assertIn("відключення скінчилось о 10:30", text)  # пост о 09:24 був про слот 04:00–10:30
         self.assertNotIn("Світла немає", text)
-        self.assertIn("🚧 Частина адрес групи без світла (сайт ДТЕК): екстрене у 9 з 63", text)
+        self.assertIn("🚧 Аварія: 9 з 63 адрес", text)
         self.assertIn("до <b>12:30</b> · вул. 20-річчя Перемоги", text)
         self.assertIn("далі <b>13:00–19:30</b>", text)
 
@@ -1016,7 +1016,7 @@ class WeakSensorsTests(DbCase):
         self.assertEqual(changes, [])  # одна точка — групі не пушимо
         st = await svb.group_state("dtek", "18.1")
         self.assertEqual((st["state"], st["weak"]), ("on", True))  # не застрягло на «нема»
-        self.assertIn("🟢 є світло (1/1 точка — мало датчиків, лише орієнтир)", svb.status_line(st))
+        self.assertIn("📡 Датчики: 🟢 1 з 1 зі світлом · мало точок", svb.status_line(st))
         self.assertFalse(await status.sensors_say_on("18.1", "dtek"))  # для рішень про групу — ні
 
 
@@ -1027,4 +1027,4 @@ class HouseScheduleUntilTests(DbCase):
         await db.kv_set("house_seen:1", json.dumps({"kind": "schedule", "reason": "відключення за графіком",
                                                     "start": f"08:40 {today}", "end": f"13:30 {today}",
                                                     "ts": int(time.time())}))
-        self.assertIn("🔴 відключення за графіком до <b>13:30</b>", await status.house_block(await db.get_user(1)))
+        self.assertIn("🔴 За графіком до <b>13:30</b>", await status.house_block(await db.get_user(1)))
