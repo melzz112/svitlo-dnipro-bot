@@ -547,11 +547,18 @@ async def crowd_people(grp: str, provider: str, since: float) -> dict[str, tuple
     return out
 
 
+def _no_channel_sql() -> str:
+    """Аварії з Telegram-каналів вимкнені (CHANNEL_ALERTS=false) — лише сайт ДТЕК."""
+    import config
+
+    return "" if config.CHANNEL_ALERTS else " AND COALESCE(src,'channel')!='channel'"
+
+
 async def off_alerts(grp: str, provider: str, hours=12):
     since = int(time.time()) - hours * 3600
     return await _all(
-        "SELECT * FROM alerts WHERE kind='off' AND grp=? AND provider IN (?, '*') AND ts>=? ORDER BY ts",
-        (grp, provider, since),
+        "SELECT * FROM alerts WHERE kind='off' AND grp=? AND provider IN (?, '*') AND ts>=?" + _no_channel_sql()
+        + " ORDER BY ts", (grp, provider, since),
     )
 
 
@@ -622,7 +629,7 @@ async def last_alert(kind, grp, minutes, provider="dtek", src=None):
     since = int(time.time()) - int(minutes * 60)
     rows = await _all(
         "SELECT * FROM alerts WHERE kind=? AND grp=? AND provider IN (?, '*') AND ts>=?"
-        + (" AND src=?" if src else "") + " ORDER BY ts DESC LIMIT 1",
+        + (" AND src=?" if src else _no_channel_sql()) + " ORDER BY ts DESC LIMIT 1",
         (kind, grp, provider, since) + ((src,) if src else ()),
     )
     return rows[0] if rows else None
@@ -631,8 +638,8 @@ async def last_alert(kind, grp, minutes, provider="dtek", src=None):
 async def latest_alert(grp, hours=6, provider="dtek"):
     since = int(time.time()) - hours * 3600
     rows = await _all(
-        "SELECT * FROM alerts WHERE (grp=? OR grp='*') AND provider IN (?, '*') AND ts>=? ORDER BY ts DESC LIMIT 1",
-        (grp, provider, since),
+        "SELECT * FROM alerts WHERE (grp=? OR grp='*') AND provider IN (?, '*') AND ts>=?" + _no_channel_sql()
+        + " ORDER BY ts DESC LIMIT 1", (grp, provider, since),
     )
     return rows[0] if rows else None
 

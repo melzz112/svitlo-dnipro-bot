@@ -16,6 +16,8 @@ import groups  # noqa: E402
 def _isolated(tmp_path, monkeypatch):
     """Кожен тест — своя порожня БД (тест може підмінити DB_PATH сам), типові черги, без паузи сайту ДТЕК."""
     monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "default.db"))
+    import config
+    monkeypatch.setattr(config, "CHANNEL_ALERTS", True)  # старі тести перевіряють і логіку каналів
     # без справжнього браузера; тести браузерної сесії вмикають його самі (з фейковим nodriver)
     monkeypatch.setattr(dtek_http, "BROWSER_ENABLED", False)
     monkeypatch.setattr(dtek_http, "DTEK_COOKIE_CACHE", str(tmp_path / "dtek_cookies.json"))

@@ -234,8 +234,13 @@ async def send_alerts(bot: Bot):
     if not alerts:
         return
     users = [u for u in await db.users_with_group() if u["notify_on"]]
+    import config
+
     for a in alerts:
         src = a.get("src") or "channel"
+        if src == "channel" and not config.CHANNEL_ALERTS:  # аварії з каналів вимкнені — лише сайт ДТЕК
+            await db.mark_alert_sent(a["key"])
+            continue
         if a["kind"] == "on" and src not in OFFICIAL_SRC:
             if time.time() - a["ts"] < ON_HOLD_SEC:
                 continue  # ще чекаємо, що скажуть люди

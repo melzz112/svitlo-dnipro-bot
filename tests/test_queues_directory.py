@@ -1028,3 +1028,26 @@ class HouseScheduleUntilTests(DbCase):
                                                     "start": f"08:40 {today}", "end": f"13:30 {today}",
                                                     "ts": int(time.time())}))
         self.assertIn("🔴 За графіком до <b>13:30</b>", await status.house_block(await db.get_user(1)))
+
+
+class NoChannelAlertsTests(DbCase):
+    """CHANNEL_ALERTS=false: аварії по групі — лише з сайту ДТЕК; пости каналів не впливають на статус і не пушаться."""
+
+    async def test_channel_posts_ignored(self):
+        import config
+        G.register(NEW_QUEUES)
+        await db.set_user(1, grp="14.1", provider="dtek")
+        with patch.object(config, "CHANNEL_ALERTS", False):
+            await db.add_alert("ch-off", "off", "14.1", "19:45",
+                               "🚨 <b>Світла ще немає, відновлення очікується</b> · група <b>14.1</b>")
+            bot = AsyncMock()
+            await notifier.send_alerts(bot)
+            self.assertEqual(bot.send_message.await_count, 0)  # не пушимо
+            text = await _verdict("14.1")
+            self.assertNotIn("Канали", text)
+            self.assertNotIn("Світла немає", text)  # статус групи — без каналів
+            with patch.object(userbot, "save_schedules", AsyncMock(return_value=0)) as sched, \
+                    patch.object(userbot, "parse_channel") as parse_ch:
+                await userbot._handle_post("🚨 14.1 світла ще немає, відновлення до 19:45")
+            sched.assert_awaited()  # графіки з постів лишаються
+            parse_ch.assert_not_called()  # аварії з постів — ні

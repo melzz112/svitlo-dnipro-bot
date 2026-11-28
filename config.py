@@ -21,6 +21,9 @@ CHANNELS = _list("CHANNELS")  # канали-агрегатори: пости ->
 CHATS = _list("CHATS")  # додаткові чати, де пишуть люди
 ADMIN_IDS = [int(x) for x in _list("ADMIN_IDS") if x.lstrip("-").isdigit()]  # Telegram ID тих, кому доступна /stats
 CROWD_MIN = int(os.getenv("CROWD_MIN") or 3)
+# Аварії / «дали» / оголошення з Telegram-каналів (CHANNELS). Вимкнено: аварії по групі беремо лише з сайту ДТЕК.
+# Графіки з постів каналів (запасне джерело) і повідомлення людей у чатах працюють і без цього.
+CHANNEL_ALERTS = os.getenv("CHANNEL_ALERTS", "false").strip().lower() in ("1", "true", "yes", "on")
 QUIET_FROM = int(os.getenv("QUIET_FROM") or 23)  # тихі години (київський час), якщо людина їх увімкнула
 QUIET_TO = int(os.getenv("QUIET_TO") or 7)
 DIGEST_HOUR = int(os.getenv("DIGEST_HOUR") or 7)  # ранкове зведення  # скільки різних людей за 15 хв = «люди пишуть, що дали»

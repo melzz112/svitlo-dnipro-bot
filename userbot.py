@@ -120,8 +120,13 @@ async def channel_incident(a, extension: bool) -> int:
 
 
 async def _handle_post(raw: str):
-    """Пост каналу -> графіки в БД і/або alerts з антиспамом; аварії з часом — у group_incidents."""
+    """Пост каналу -> графіки в БД і/або alerts з антиспамом; аварії з часом — у group_incidents.
+    CHANNEL_ALERTS=false (за замовчуванням) — з каналів беремо лише графіки, аварії — тільки з сайту ДТЕК."""
+    import config
+
     await save_schedules(raw, datetime.now(TZ))
+    if not config.CHANNEL_ALERTS:
+        return
     for a in parse_channel(raw):
         extension = False
         if a.kind == "general":
