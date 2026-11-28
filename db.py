@@ -403,7 +403,8 @@ async def end_incidents_except(operator: str, streets: set[str], keep: set[int])
 async def pending_incidents() -> list[dict]:
     """Ще не розіслані групі й ще не скінчені."""
     await expire_incidents()
-    return await _all("SELECT * FROM group_incidents WHERE notified_group=0 AND status='active' ORDER BY id")
+    return await _all("SELECT * FROM group_incidents WHERE notified_group=0 AND status='active'"
+                      + _no_channel_incidents_sql() + " ORDER BY id")
 
 
 async def mark_incident_notified(iid: int):
@@ -429,6 +430,7 @@ async def extensions_today(operator: str, grp: str, reason: str) -> int:
 async def active_incidents(operator: str, grp: str, now: int | None = None) -> list[dict]:
     return await _all(
         "SELECT * FROM group_incidents WHERE operator=? AND group_name=? AND status='active' AND end_time>? "
+        + _no_channel_incidents_sql() + " "
         "ORDER BY end_time DESC", (operator, grp, int(now or time.time())),
     )
 
@@ -545,6 +547,13 @@ async def crowd_people(grp: str, provider: str, since: float) -> dict[str, tuple
     ):
         out[f"bot{r['user_id']}"] = (r["status"], r["ts"])
     return out
+
+
+def _no_channel_incidents_sql() -> str:
+    """Інциденти з каналів — без вулиці (сайт ДТЕК завжди дає вулицю); при CHANNEL_ALERTS=false їх не беремо."""
+    import config
+
+    return "" if config.CHANNEL_ALERTS else " AND street_name IS NOT NULL"
 
 
 def _no_channel_sql() -> str:

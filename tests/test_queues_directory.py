@@ -1051,3 +1051,14 @@ class NoChannelAlertsTests(DbCase):
                 await userbot._handle_post("🚨 14.1 світла ще немає, відновлення до 19:45")
             sched.assert_awaited()  # графіки з постів лишаються
             parse_ch.assert_not_called()  # аварії з постів — ні
+
+
+class NoChannelIncidentsTests(DbCase):
+    async def test_channel_incident_hidden_site_incident_kept(self):
+        import config
+        end = int(time.time()) + 3600
+        await db.upsert_incident("dtek", "14.1", None, "аварійне відключення", None, end)  # з каналу — без вулиці
+        await db.upsert_incident("dtek", "14.1", "вул. Тополина", "екстрене відключення", None, end)
+        with patch.object(config, "CHANNEL_ALERTS", False):
+            self.assertEqual([i["street_name"] for i in await db.active_incidents("dtek", "14.1")], ["вул. Тополина"])
+            self.assertEqual([i["street_name"] for i in await db.pending_incidents()], ["вул. Тополина"])
