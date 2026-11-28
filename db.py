@@ -335,6 +335,21 @@ async def load_known_groups() -> list[str]:
     return G.known()
 
 
+ADDR_FAIL_KEEP = 100
+
+
+async def log_addr_fail(street: str, house: str, why: str, picked: str = ""):
+    """Адреса, яку бот не знайшов (без імені людини) — щоб бачити в /db, чого бракує в пошуку."""
+    items = json.loads(await kv_get("addr_fail") or "[]")
+    items.append({"ts": int(time.time()), "q": street[:60], "house": house[:12], "why": why, "picked": picked[:60]})
+    await kv_set("addr_fail", json.dumps(items[-ADDR_FAIL_KEEP:], ensure_ascii=False))
+    await bump(f"addr_{why}")
+
+
+async def addr_fails(limit: int = 10) -> list[dict]:
+    return json.loads(await kv_get("addr_fail") or "[]")[-limit:]
+
+
 async def users_in_group(operator: str, grp: str) -> list[dict]:
     return await _all("SELECT * FROM users WHERE grp=? AND COALESCE(provider,'dtek')=? AND notify_on=1",
                       (grp, operator))

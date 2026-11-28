@@ -931,3 +931,45 @@ class OutageHoursTests(DbCase):
         self.assertIsNotNone(log_[-1][1])
         await dtek_site.log_outage(1, True, "")  # знову вимкнули — новий проміжок
         self.assertIsNone(json.loads(await db.kv_get("house_log:1"))[-1][1])
+
+
+class AddressSearchTests(DbCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        streets = {"вул. Яворницького": [("2", "17.1")], "просп. Яворницького Дмитра": [("50", "18.1"), ("10", "17.1")],
+                   "вул. Космічна": [("9", "17.1")], "просп. Героїв": [("20", "17.1")], "вул. Героїв Дніпра": [("20", "18.1")],
+                   "просп. Мазепи Івана": [("20", "15.1")], "вул. Титова": [("5", "16.1")], "вул. Тилова": [("30", "16.1")],
+                   "просп. Олександра Поля": [("50", "15.1")], "вул. Старокозацька": [("30", "15.1")],
+                   "просп. Мануйлівський": [("60", "16.1")]}
+        await db.upsert_streets(list(streets))
+        for st, houses in streets.items():
+            await db.save_houses(st, [(n, [g], "") for n, g in houses])
+
+    async def found(self, street, house):
+        r = await dtek_site.lookup_cached(street, house)
+        return (r.street, r.house.num if r.house else None) if r else None
+
+    async def test_russian_old_names_and_house_choice(self):
+        self.assertEqual(await self.found("Космическая", "9"), ("вул. Космічна", "9"))
+        self.assertEqual(await self.found("Мазепы", "20"), ("просп. Мазепи Івана", "20"))
+        self.assertEqual(await self.found("Героев", "20"), ("просп. Героїв", "20"))  # не «Героїв Дніпра»
+        self.assertEqual(await self.found("Карла Маркса", "10"), ("просп. Яворницького Дмитра", "10"))
+        self.assertEqual(await self.found("Кірова", "50"), ("просп. Олександра Поля", "50"))
+        self.assertEqual(await self.found("Комсомольская", "30"), ("вул. Старокозацька", "30"))
+        self.assertEqual(await self.found("Калинина", "60"), ("просп. Мануйлівський", "60"))
+        # «Яворницького 50» — і вулиця, і проспект; будинок 50 лише на проспекті
+        self.assertEqual(await self.found("Яворницького", "50"), ("просп. Яворницького Дмитра", "50"))
+        self.assertEqual(await self.found("просп. Яворницького", "50"), ("просп. Яворницького Дмитра", "50"))
+        # є точна «вул. Титова» — схожу «вул. Тилова» (де будинок 30 є) не підставляємо
+        self.assertEqual(await self.found("Титова", "30"), ("вул. Титова", None))
+
+    async def test_failed_search_is_logged_for_db(self):
+        import directory_refresh as dr
+        await db.set_user(1)
+        state = FSMContext(storage=MemoryStorage(), key=StorageKey(bot_id=1, chat_id=1, user_id=1))
+        await state.set_state(handlers.Addr.waiting)
+        with patch.object(dtek_site, "site_blocked", AsyncMock(return_value=True)):
+            await handlers.addr_text(_Msg("Космическая 99"), state)
+        fails = await db.addr_fails()
+        self.assertEqual((fails[-1]["q"], fails[-1]["house"], fails[-1]["why"]), ("Космическая", "99", "house"))
+        self.assertIn("«Космическая 99» — будинку немає на вул. Космічна", await dr.report())

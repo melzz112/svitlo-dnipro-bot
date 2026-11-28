@@ -446,6 +446,8 @@ async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str
             await m.answer(PICK_TEXT.format(prov=_pname(u)), reply_markup=kb.groups_kb(u["grp"], _prov(u)))
             return
         res = dtek_site.Lookup()  # вулиці немає в переліку ДТЕК — нижче попросимо перевірити назву
+    if not res.street:
+        await db.log_addr_fail(street_q, house, "street")
     if not res.street and (opts := street_options(street_q, await db.street_names())):
         await state.update_data(opts=opts, house=house)  # «Шевченка» -> вул. / пров.; одруківка -> схожі
         await state.set_state(Addr.pick)
@@ -461,6 +463,7 @@ async def _addr_resolve(m: Message, state: FSMContext, street_q: str, house: str
     await state.clear()
     await db.set_user(uid, addr_q="")  # адресу знайшли — більше не чекаємо сайт
     if not res.house:
+        await db.log_addr_fail(street_q, house, "house", res.street)
         await m.answer(
             f"Вулицю знайшов (<b>{escape(res.street)}</b>), але будинку <b>{escape(house)}</b> немає в даних ДТЕК.\n"
             "Якщо номер правильний — схоже, твій будинок обслуговує <b>ЦЕК</b>. Обери постачальника й групу вручну "

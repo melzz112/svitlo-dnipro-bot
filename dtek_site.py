@@ -294,7 +294,14 @@ async def lookup_cached(street_query: str, house: str) -> Lookup | None:
     """Те саме, що lookup, але з довідника — 0 запитів до сайту. None — цієї вулиці ще не опитували.
     Стан будинку (є/нема світла) з довідника не знаємо — його покаже наступна перевірка сайту."""
     import db
+    from address import street_matches
 
+    # «Яворницького 50»: і вулиця, і проспект — беремо ту, де будинок 50 справді є
+    known = await db.street_names()
+    for name in street_matches(street_query, known) if known else []:
+        if found := await db.find_house(name, house):
+            n = len(await db.cached_houses(name))
+            return Lookup(name, House(name, found["num"], found["groups"], None, cek=found["cek"]), n)
     for name in await street_candidates(street_query):
         found = await db.find_house(name, house)
         if found:

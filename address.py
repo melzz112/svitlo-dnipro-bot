@@ -60,26 +60,95 @@ def _core_tokens(name: str) -> tuple[str, ...]:
     return tuple(sorted(street_core(name).split()))
 
 
+# Перейменовані вулиці Дніпра: люди досі пишуть старі назви, а в ДТЕК — лише нові
+OLD_NAMES = {
+    "карла маркса": "просп. Яворницького",
+    "кірова": "просп. Олександра Поля", "кирова": "просп. Олександра Поля",
+    "калініна": "просп. Мануйлівський", "калинина": "просп. Мануйлівський",
+    "петровського": "просп. Богдана Хмельницького", "петровского": "просп. Богдана Хмельницького",
+    "комсомольська": "вул. Старокозацька", "комсомольская": "вул. Старокозацька",
+    "газети правди": "просп. Слобожанський", "газеты правды": "просп. Слобожанський",
+    "запорожское": "Запорізьке шосе", "запорожское шоссе": "Запорізьке шосе",
+}
+
+
+def _skel(s: str) -> str:
+    """Спільний «скелет» укр./рос. написання: «Героев»~«Героїв», «Мазепы»~«Мазепи», «Хмельницкого»~«Хмельницького»."""
+    t = _norm_text(s).lower().replace("'", "").replace("ь", "").replace("ъ", "")
+    t = t.replace("ськ", "ск").replace("цьк", "цк").replace("ґ", "г")
+    return t.translate(str.maketrans({"і": "и", "ї": "и", "ы": "и", "є": "е", "э": "е", "ё": "е"}))
+
+
+def _tokens_close(a: str, b: str) -> bool:
+    x, y = _skel(a), _skel(b)
+    if x == y:
+        return True
+    common = next((i for i, (p, q) in enumerate(zip(x, y)) if p != q), min(len(x), len(y)))
+    if min(len(x), len(y)) >= 5 and common >= max(5, min(len(x), len(y)) - 3):
+        return True  # «космическая»~«космічна»: відрізняються лише закінченням
+    return min(len(x), len(y)) >= 5 and difflib.SequenceMatcher(None, x, y).ratio() >= 0.8
+
+
+def _old_name(query: str) -> str:
+    core = street_core(query)
+    for old, new in OLD_NAMES.items():
+        if core == old or _skel(core) == _skel(old):
+            return new
+    return query
+
+
+def _buckets(query: str, streets: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """(точний збіг, усі слова запиту є в назві, схожі слова — рос. написання / закінчення)."""
+    q_core, q_tokens = street_core(query), _core_tokens(query)
+    if not q_core:
+        return [], [], []
+    exact = [s for s in streets if street_core(s) == q_core or _core_tokens(s) == q_tokens]
+    contains = [s for s in streets if s not in exact and set(q_tokens) <= set(_core_tokens(s))]
+    seen = set(exact) | set(contains)
+    if exact or contains:  # є справжній збіг — схожі назви («Тилова» для «Титова») не беремо
+        return exact, contains, []
+    fuzzy = [s for s in streets if s not in seen
+             and all(any(_tokens_close(q, t) for t in _core_tokens(s)) for q in q_tokens)]
+    # «Героев» -> «просп. Героїв» (одне слово, як у запиті) раніше за «вул. Героїв Дніпра»
+    fuzzy.sort(key=lambda s: (len(_core_tokens(s)) != len(q_tokens), len(s)))
+    return exact, contains, fuzzy
+
+
+def street_matches(query: str, streets: list[str], limit: int = 8) -> list[str]:
+    """Усі правдоподібні вулиці ДТЕК, найкращі першими: спершу того ж типу («просп.»), потім точні, потім
+    «усі слова є в назві», потім схожі. Пошук будинку перебирає їх і бере ту, де такий будинок справді є."""
+    query = _old_name(query)
+    q_type = street_type(query)
+    exact, contains, fuzzy = _buckets(query, streets)
+    ordered = [s for b in (exact, contains, fuzzy) for s in b if q_type and street_type(s) == q_type]
+    ordered += [s for b in (exact, contains, fuzzy) for s in b]
+    return list(dict.fromkeys(ordered))[:limit]
+
+
 def match_street(query: str, streets: list[str]) -> str | None:
     """Найкраща назва вулиці з переліку ДТЕК для назви з OSM чи тексту людини. None — не знайшли."""
-    q_core, q_tokens, q_type = street_core(query), _core_tokens(query), street_type(query)
-    if not q_core:
-        return None
-    exact = [s for s in streets if street_core(s) == q_core or _core_tokens(s) == q_tokens]
+    query = _old_name(query)
+    q_type = street_type(query)
+    exact, contains, fuzzy = _buckets(query, streets)
+    if not (exact or contains or fuzzy):
+        cores = {street_core(s): s for s in streets}
+        close = difflib.get_close_matches(street_core(query), list(cores), n=1, cutoff=0.88)
+        return cores[close[0]] if close else None
+    if q_type:  # «просп. Яворницького» — проспект, навіть якщо є й «вул. Яворницького»
+        for b in (exact, contains, fuzzy):
+            same = [s for s in b if street_type(s) == q_type]
+            if len(same) == 1 or (b is exact and same):
+                return same[0]
     if exact:
-        same_type = [s for s in exact if street_type(s) == q_type]
-        return (same_type or exact)[0]
+        return exact[0]
     # «Яворницького» -> «просп. Дмитра Яворницького»: усі слова запиту є в назві, і вона однозначна
-    contains = [s for s in streets if set(q_tokens) <= set(_core_tokens(s))]
-    if len(contains) == 1:
-        return contains[0]
-    if len(contains) > 1:
-        same_type = [s for s in contains if street_type(s) == q_type]
-        if len(same_type) == 1:
-            return same_type[0]
-    cores = {street_core(s): s for s in streets}
-    close = difflib.get_close_matches(q_core, list(cores), n=1, cutoff=0.88)
-    return cores[close[0]] if close else None
+    for b in (contains, fuzzy):
+        if len(b) == 1:
+            return b[0]
+        same = [s for s in b if street_type(s) == q_type]
+        if len(same) == 1:
+            return same[0]
+    return None
 
 
 def street_options(query: str, streets: list[str], limit: int = 6) -> list[str]:
@@ -94,12 +163,14 @@ def street_options(query: str, streets: list[str], limit: int = 6) -> list[str]:
         tokens = _core_tokens(s)
         return all(any(t.startswith(q) for t in tokens) for q in q_tokens)
 
-    found = [s for s in streets if has_all(s)]
+    found = list(dict.fromkeys(street_matches(query, streets, limit) + [s for s in streets if has_all(s)]))
     if not found:
         cores = {street_core(s): s for s in streets}
         found = [cores[c] for c in difflib.get_close_matches(street_core(query), list(cores), n=limit, cutoff=0.75)]
         return found[:limit]
-    return sorted(found, key=lambda s: (street_type(s) != q_type, len(s), s))[:limit]
+    first = street_matches(query, streets, limit)
+    rest = sorted((s for s in found if s not in first), key=lambda s: (street_type(s) != q_type, len(s), s))
+    return (first + rest)[:limit]
 
 
 def guess_dtek_names(query: str) -> list[str]:

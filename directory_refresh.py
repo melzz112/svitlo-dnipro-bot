@@ -201,6 +201,11 @@ async def report() -> str:
     top = sorted(((g, n) for g, n in counts.items() if g != "—"), key=lambda x: -x[1])
     if top:
         lines.append("Черги: " + ", ".join(f"{g} — {n}" for g, n in top))
+    if fails := await db.addr_fails(8):
+        lines += ["", f"🔎 <b>Не знайдені адреси</b> (останні {len(fails)}):"]
+        for f in reversed(fails):
+            what = "вулиці немає" if f["why"] == "street" else f"будинку немає на {f.get('picked') or '?'}"
+            lines.append(f"• {datetime.fromtimestamp(f['ts'], TZ):%d.%m %H:%M} «{f['q']} {f['house']}» — {what}")
     st = await state()
     lines.append("")
     if st and st.get("running"):
