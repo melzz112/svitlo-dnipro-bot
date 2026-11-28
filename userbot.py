@@ -20,6 +20,7 @@ from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelReq
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 from telethon.tl.types import ChatInviteAlready, PeerUser
 
+import chat_streets
 import db
 import groups as G
 from config import API_HASH, API_ID, CHANNELS, CHATS, TZ
@@ -38,7 +39,7 @@ def alert_key(a, raw: str) -> str:
     return f"{a.provider}:{a.kind}:{a.grp}:{day}:{bucket}"
 
 
-MIN_SHIFT_MIN = 30  # «продовжено до 10:16» після «до 10:03» — не новина; пушимо зсув від 30 хв
+MIN_SHIFT_MIN = 60  # «продовжено до 10:16» після «до 10:03» — не новина; пушимо зсув від години
 _post_lock = asyncio.Lock()  # два канали постять одне й те саме в ту ж секунду -> без дублів
 
 
@@ -229,6 +230,10 @@ async def main():
         res = parse_user(event.raw_text or "", reply_raw)
         if not res:
             return
+        try:  # вулиця з повідомлення -> черга за довідником (і замість старого номера на кшталт 1.2)
+            res = await chat_streets.apply(res, event.raw_text or "")
+        except Exception as e:
+            log.warning("вулиця з чату: %r", e)
         chat = getattr(event.chat, "title", "") or ""
         # автора НЕ зберігаємо — лише солоний хеш, щоб рахувати різних людей
         who = hashlib.sha256(f"{API_HASH}:{msg.from_id.user_id}".encode()).hexdigest()[:12]
